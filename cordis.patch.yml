@@ -1,0 +1,4 @@
+# dsh-knj-prompts bundle patch
+- insert:
+    - id: dsh-knj-prompts
+      name: 'dsh-knj-prompts'
