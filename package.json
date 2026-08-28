@@ -1,6 +1,6 @@
 {
   "name": "dsh-knj-prompts",
-  "version": "2026.8.281",
+  "version": "2026.8.282",
   "description": "DSH 提示词场景插件：下拉选场景 → 自动开新会话并填充提示词（支持 {变量}），微调即可发送",
   "type": "module",
   "main": "lib/index.js",
@@ -15,8 +15,9 @@
     },
     "client": {
       "inject": [
-        "@deepseek-ai/dsh-client-runtime",
-        "@deepseek-ai/dsh-client-ui-slots"
+        "slots",
+        "sessions",
+        "conversation"
       ],
       "platform": "web"
     }
