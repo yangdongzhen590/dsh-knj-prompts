@@ -8,36 +8,48 @@
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { fetchScenes, saveScenes } from './api.ts'
-import { extractVariables, fillPrompt, resolveSceneAction, uniqueId, validateScene } from './engine.ts'
+import {
+  extractVariables,
+  fillPrompt,
+  isPendingFillEligible,
+  PENDING_TTL_MS,
+  resolveSceneAction,
+  uniqueId,
+  validateScene,
+} from './engine.ts'
 import { IconChevronDown, IconClose, IconPlus, IconSparkles, IconTrash } from './icons.tsx'
 import type { Scene } from '../types.ts'
 
 /** 挂起填充：跨会话切换传递待填文本（模块级，生命周期 = 页面）。 */
-interface PendingFill { text: string; at: number }
+interface PendingFill { text: string; at: number; fromSessionId?: string }
 let pendingFill: PendingFill | undefined
-/** 挂起有效期：超时丢弃，避免 startSession 失败后误填之后手动新建的会话。 */
-const PENDING_TTL_MS = 15_000
 
 /** 宿主注入本组件的最小结构面（标准套件 + InputZone owner share）。 */
 export interface ScenePickerProps {
+  /** 标准套件：当前会话 id（挂起填充的会话差量守卫用）。 */
+  sessionId?: string
   /** InputZone owner share：会话快照（blank=空日志）与输入机状态。 */
   session?: { blank?: boolean }
   input?: { draft?: string }
   /** 标准套件：inputActions.setDraft 是唯一公开草稿写通道。 */
   inputActions?: { setDraft(text: string): void }
-  /** apply 闭包传入：workspaces.startSession = 官方「新建会话」动作。 */
-  workspaces?: { startSession(workspaceId?: string): void }
+  /**
+   * 懒解析的 workspaces 服务（apply 传 getter，点击时再读——服务彼时必已挂载；
+   * 缺服务时返回 undefined，降级为原地填充，绝不阻塞 boot）。
+   */
+  workspaces?: () => { startSession(workspaceId?: string): void } | undefined
 }
 
 /** 应用填充：决策见 engine.resolveSceneAction（空白→原地填；非空白→挂起并切新会话；无通道→兜底填当前）。 */
 function applySceneText(props: ScenePickerProps, text: string): void {
-  const action = resolveSceneAction(props.session?.blank === true, props.workspaces !== undefined)
+  const workspaces = props.workspaces?.()
+  const action = resolveSceneAction(props.session?.blank === true, workspaces !== undefined)
   if (action === 'fill-here') {
     props.inputActions?.setDraft(text)
     return
   }
-  pendingFill = { text, at: Date.now() }
-  props.workspaces!.startSession()
+  pendingFill = { text, at: Date.now(), fromSessionId: props.sessionId }
+  workspaces!.startSession()
 }
 
 export function ScenePicker(props: ScenePickerProps) {
@@ -52,17 +64,24 @@ export function ScenePicker(props: ScenePickerProps) {
   const btnRef = useRef<HTMLButtonElement>(null)
   const popRef = useRef<HTMLDivElement>(null)
 
-  // 消费挂起填充：新空白会话挂载/重渲染时落地（TTL 内有效；幂等）
+  // 消费挂起填充：新空白会话挂载/重渲染时落地（TTL 内 + 会话差量守卫；幂等）
   useEffect(() => {
     if (!pendingFill) return
-    if (Date.now() - pendingFill.at > PENDING_TTL_MS) {
-      pendingFill = undefined
-      return
-    }
-    if (props.session?.blank && props.inputActions) {
+    if (
+      isPendingFillEligible(
+        props.session?.blank === true,
+        Date.now() - pendingFill.at,
+        pendingFill.fromSessionId,
+        props.sessionId,
+      ) &&
+      props.inputActions
+    ) {
       const text = pendingFill.text
       pendingFill = undefined
       props.inputActions.setDraft(text)
+    } else if (Date.now() - pendingFill.at > PENDING_TTL_MS) {
+      // 过期清理：不让挂起填充无限滞留
+      pendingFill = undefined
     }
   })
 

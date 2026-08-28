@@ -32,19 +32,30 @@ interface ClientContext {
 
 /**
  * 客户端插件在 cordis 里等待的服务（真实服务名，见 PROBE.md）：
- * - slots      —— 由 @deepseek-ai/dsh-client-runtime 提供（SlotRegistry）
- * - workspaces —— 由 @deepseek-ai/dsh-client-runtime 提供（IWorkspaces.startSession）
+ * - slots —— 由 @deepseek-ai/dsh-client-runtime 提供（SlotRegistry）。
+ *   **只硬依赖 slots**：workspaces 用懒 getter 在交互时解析（与 dsh-knj-obsidian
+ *   同款防御式读法）——宿主缺该服务时降级为「原地填充」而非 fiber 永久 pending
+ *   阻塞 web boot；也避免 boot 早期（workspaces 尚未挂载）读到 undefined。
  * 会话/输入能力（sessionId / inputActions / InputZone owner share）经插槽标准套件
  * 注入组件本身，无需在此 inject。注意：包名不是服务名——写包名（如
  * @deepseek-ai/dsh-client-ui-slots）会让 fiber 永远 pending，web boot 直接失败。
  */
-export const inject = ['slots', 'workspaces']
+export const inject = ['slots']
 
 export function apply(ctx: ClientContext): void {
   ctx.effect(() => {
     injectPromptStyles()
     if (!ctx.slots) return
-    const workspaces = ctx.workspaces
+    /** 懒解析：点击场景时再读（此时宿主已完整 boot）。cordis 服务用 ctx.get(name)
+     *  访问——ctx.workspaces 属性只在 fiber 声明了 inject 时才存在。 */
+    const workspacesGet = (): WorkspacesLike | undefined => {
+      try {
+        const get = (ctx as unknown as { get?: (name: string) => unknown }).get
+        return (typeof get === 'function' ? get('workspaces') : undefined) as WorkspacesLike | undefined
+      } catch {
+        return undefined
+      }
+    }
     const dispose = ctx.slots.register({
       name: 'conversation.input.right',
       id: 'knj-prompts',
@@ -52,10 +63,11 @@ export function apply(ctx: ClientContext): void {
     }, (props) => {
       const p = props as ScenePickerProps
       return h(ScenePicker, {
+        sessionId: p.sessionId,
         session: p.session,
         input: p.input,
         inputActions: p.inputActions,
-        workspaces,
+        workspaces: workspacesGet,
       })
     })
     return () => { dispose() }

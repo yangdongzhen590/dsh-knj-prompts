@@ -70,3 +70,25 @@ export function uniqueId(name: string, existingIds: readonly string[]): string {
   for (let i = 2; existingIds.includes(id); i++) id = `${base}-${i}`
   return id
 }
+
+/** 挂起填充有效期：超过后丢弃（startSession 失败时不误填之后手动新建的会话）。 */
+export const PENDING_TTL_MS = 15_000
+
+/**
+ * 挂起填充是否可在当前挂载的会话上落地：
+ * - 会话必须空白（blank）；
+ * - 必须在 TTL 内；
+ * - mountId 与 fromId 都必须存在且不同（确认为新会话，而非同一会话重挂载）。
+ * 无法确认会话身份（任一缺失）时保守拒绝。
+ */
+export function isPendingFillEligible(
+  sessionBlank: boolean,
+  elapsedMs: number,
+  fromSessionId: string | undefined,
+  mountSessionId: string | undefined,
+): boolean {
+  if (!sessionBlank) return false
+  if (elapsedMs > PENDING_TTL_MS) return false
+  if (mountSessionId === undefined || fromSessionId === undefined) return false
+  return mountSessionId !== fromSessionId
+}

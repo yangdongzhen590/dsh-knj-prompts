@@ -7,10 +7,10 @@ Task 3 探针 + 2026.8.282 修复会话实测（web profile 实机启动验证�
 
 | 服务名 | 提供方 | 本插件用途 |
 | --- | --- | --- |
-| `slots` | @deepseek-ai/dsh-client-runtime（SlotRegistry） | 注册 `conversation.input.right` |
-| `workspaces` | @deepseek-ai/dsh-client-runtime（IWorkspaces） | `startSession()` = 官方「新建会话」 |
-| `sessions` | 同包（ISessions） | Task 4 不再直接依赖（经插槽标准套件即可） |
-| `conversation` | @deepseek-ai/dsh-client-ui-conversation | Task 4 不再直接依赖 |
+| `slots` | @deepseek-ai/dsh-client-runtime（SlotRegistry） | 注册 `conversation.input.right`（**唯一硬依赖**） |
+| `workspaces` | 同包（IWorkspaces） | `startSession()` = 官方「新建会话」；**防御式读取**（不 inject，宿主缺服务时降级为原地填充，绝不阻塞 boot） |
+| `sessions` | 同包（ISessions） | 经插槽标准套件即可，不直接依赖 |
+| `conversation` | @deepseek-ai/dsh-client-ui-conversation | 经插槽标准套件即可，不直接依赖 |
 
 ## conversation.input.right（list 插槽，session 作用域）
 
