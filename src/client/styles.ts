@@ -132,6 +132,30 @@ export const PROMPT_CSS = /* css */ `
 .knj-p .p-manage-name { font-size: 13px; font-weight: 500; color: var(--p-text); display: flex; align-items: center; gap: 6px; }
 .knj-p .p-manage-desc { font-size: 11px; color: var(--p-text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .knj-p .p-manage-actions { display: flex; gap: 2px; flex: none; }
+.knj-p .p-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--p-border-soft); padding-bottom: 8px; }
+.knj-p .p-tab {
+  border: 1px solid transparent; border-radius: 6px; padding: 4px 14px;
+  font-size: 12px; line-height: 18px; color: var(--p-text-2); background: transparent; cursor: pointer;
+  transition: background .12s ease, color .12s ease;
+}
+.knj-p .p-tab:hover { background: var(--p-hover); color: var(--p-text); }
+.knj-p .p-tab--on { background: var(--p-active); color: var(--p-text); }
+.knj-p .p-search { margin-bottom: 4px; flex: none; }
+.knj-p .p-combo { position: relative; }
+.knj-p .p-combo-pop {
+  z-index: 80; max-height: 220px; overflow: auto;
+  background: var(--p-bg-1); border: 1px solid var(--p-border); border-radius: 8px;
+  box-shadow: var(--dsw-shadow-lv3, 0 12px 32px rgba(0, 0, 0, 0.2));
+  padding: 4px; display: flex; flex-direction: column; gap: 2px;
+}
+.knj-p .p-combo-item {
+  display: flex; align-items: baseline; gap: 6px; text-align: left; padding: 6px 10px;
+  border-radius: 6px; border: none; background: transparent; color: var(--p-text);
+  cursor: pointer; font-size: 12px; line-height: 18px; white-space: nowrap;
+}
+.knj-p .p-combo-item:hover { background: var(--p-hover); }
+.knj-p .p-combo-item__name { font-weight: 500; color: var(--p-text); }
+.knj-p .p-combo-item__val { color: var(--p-text-3); overflow: hidden; text-overflow: ellipsis; }
 `
 
 /** 注入样式（幂等）：client apply 时调用。 */
@@ -143,4 +167,10 @@ export function injectPromptStyles(): void {
   style.setAttribute('data-plugin', 'dsh-knj-prompts')
   style.textContent = PROMPT_CSS
   document.head.appendChild(style)
+}
+
+/** 移除注入样式（幂等）：插件卸载/HMR 时调用，避免旧版本样式常驻 DOM。 */
+export function removePromptStyles(): void {
+  if (typeof document === 'undefined') return
+  document.getElementById('dsh-knj-prompts-styles')?.remove()
 }

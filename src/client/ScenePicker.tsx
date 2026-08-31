@@ -7,18 +7,26 @@
  * 宿主 API 结论见 PROBE.md。
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { fetchScenes, saveScenes } from './api.ts'
+import { fetchScenes, fetchVars, saveScenes, saveVars } from './api.ts'
 import {
+  applyDraftEdit,
+  applyDraftRemove,
   extractVariables,
   fillPrompt,
+  filterScenes,
+  filterVars,
+  hasDirtyScenes,
+  hasDirtyVars,
+  hasDuplicateVarNames,
   isPendingFillEligible,
   PENDING_TTL_MS,
   resolveSceneAction,
   uniqueId,
   validateScene,
+  validateVar,
 } from './engine.ts'
 import { IconChevronDown, IconClose, IconPlus, IconSparkles, IconTrash } from './icons.tsx'
-import type { Scene } from '../types.ts'
+import type { PromptVar, Scene } from '../types.ts'
 
 /** 挂起填充：跨会话切换传递待填文本（模块级，生命周期 = 页面）。 */
 interface PendingFill { text: string; at: number; fromSessionId?: string }
@@ -28,9 +36,8 @@ let pendingFill: PendingFill | undefined
 export interface ScenePickerProps {
   /** 标准套件：当前会话 id（挂起填充的会话差量守卫用）。 */
   sessionId?: string
-  /** InputZone owner share：会话快照（blank=空日志）与输入机状态。 */
+  /** InputZone owner share：会话快照（blank=空日志）。 */
   session?: { blank?: boolean }
-  input?: { draft?: string }
   /** 标准套件：inputActions.setDraft 是唯一公开草稿写通道。 */
   inputActions?: { setDraft(text: string): void }
   /**
@@ -57,7 +64,9 @@ export function ScenePicker(props: ScenePickerProps) {
   const [mode, setMode] = useState<'menu' | 'fill'>('menu')
   const [manage, setManage] = useState(false)
   const [scenes, setScenes] = useState<Scene[] | null>(null) // null = 加载中
+  const [vars, setVars] = useState<PromptVar[] | null>(null) // 变量库（填充面板下拉候选；null = 未加载/加载失败）
   const [loadErr, setLoadErr] = useState<string | null>(null)
+  const [menuQuery, setMenuQuery] = useState('') // 下拉菜单场景搜索词（重开菜单时重置）
   const [fillScene, setFillScene] = useState<Scene | null>(null)
   const [fillValues, setFillValues] = useState<Record<string, string>>({})
   const [pos, setPos] = useState<{ right: number; bottom: number } | null>(null)
@@ -89,7 +98,10 @@ export function ScenePicker(props: ScenePickerProps) {
     setScenes(null)
     setLoadErr(null)
     try {
-      setScenes(await fetchScenes())
+      // 变量库失败不阻断场景列表（填充面板降级为自由输入）
+      const [scenes, vars] = await Promise.all([fetchScenes(), fetchVars().catch(() => null)])
+      setScenes(scenes)
+      setVars(vars)
     } catch {
       setLoadErr('场景加载失败，请重试')
     }
@@ -102,6 +114,7 @@ export function ScenePicker(props: ScenePickerProps) {
     }
     setMode('menu')
     setFillScene(null)
+    setMenuQuery('') // 重开菜单重置搜索词
     const r = btnRef.current?.getBoundingClientRect()
     if (r) {
       // 菜单从按钮上方弹出（输入框位于窗口底部），右对齐按钮
@@ -174,10 +187,10 @@ export function ScenePicker(props: ScenePickerProps) {
           style={{ position: 'fixed', right: `${pos.right}px`, bottom: `${pos.bottom}px` }}
         >
           {mode === 'menu'
-            ? renderMenu(scenes, loadErr, () => void load(), pick, () => setManage(true))
+            ? renderMenu(scenes, loadErr, menuQuery, setMenuQuery, () => void load(), pick, () => setManage(true))
             : null}
           {mode === 'fill' && fillScene
-            ? renderFill(fillScene, fillValues, setFillValues, inBlank, () => setMode('menu'), confirmFill)
+            ? renderFill(fillScene, fillValues, setFillValues, inBlank, () => setMode('menu'), confirmFill, vars)
             : null}
         </div>
       )}
@@ -185,18 +198,22 @@ export function ScenePicker(props: ScenePickerProps) {
       {manage && (
         <ManageModal
           scenes={scenes ?? []}
+          vars={vars ?? []}
           onClose={() => setManage(false)}
           onSaved={(next) => setScenes(next)}
+          onVarsSaved={(next) => setVars(next)}
         />
       )}
     </div>
   )
 }
 
-/** 下拉主面板：场景列表 + 管理入口。 */
+/** 下拉主面板：场景搜索 + 列表 + 管理入口。 */
 function renderMenu(
   scenes: Scene[] | null,
   loadErr: string | null,
+  query: string,
+  setQuery: (q: string) => void,
   retry: () => void,
   pick: (s: Scene) => void,
   openManage: () => void,
@@ -225,9 +242,17 @@ function renderMenu(
       </>
     )
   }
+  const filtered = filterScenes(scenes, query)
   return (
     <>
-      {scenes.map((s) => {
+      <input
+        className="p-input p-search"
+        value={query}
+        placeholder="搜索场景（名称/描述/提示词）"
+        spellCheck={false}
+        onChange={(e) => setQuery(e.target.value)}
+      />
+      {filtered.map((s) => {
         const vars = extractVariables(s.prompt)
         return (
           <button key={s.id} type="button" className="p-menu-item" onClick={() => pick(s)}>
@@ -246,6 +271,7 @@ function renderMenu(
           </button>
         )
       })}
+      {filtered.length === 0 ? <div className="p-empty">没有匹配的场景</div> : null}
       <div className="p-menu-sep" />
       <div className="p-menu-foot">
         <button type="button" className="p-btn p-btn--sm" onClick={openManage}>
@@ -257,7 +283,7 @@ function renderMenu(
   )
 }
 
-/** 变量填充面板：逐变量输入 + 实时预览。 */
+/** 变量填充面板：逐变量输入（变量库非空时提供「选已配置变量取值」的可搜索下拉）+ 实时预览。 */
 function renderFill(
   scene: Scene,
   values: Record<string, string>,
@@ -265,9 +291,11 @@ function renderFill(
   inBlank: boolean,
   back: () => void,
   confirm: () => void,
+  lib: PromptVar[] | null,
 ) {
   const vars = extractVariables(scene.prompt)
   const preview = fillPrompt(scene.prompt, values)
+  const hasLib = !!lib && lib.length > 0
   return (
     <>
       <div className="p-fill-head">
@@ -280,13 +308,21 @@ function renderFill(
         {vars.map((v) => (
           <label key={v} className="p-form-row">
             <span className="p-form-label">{`{${v}}`}</span>
-            <input
-              className="p-input"
-              value={values[v] ?? ''}
-              placeholder={v}
-              spellCheck={false}
-              onChange={(e) => setValues({ ...values, [v]: e.target.value })}
-            />
+            {hasLib ? (
+              <VarValueInput
+                value={values[v] ?? ''}
+                vars={lib}
+                onChange={(val) => setValues({ ...values, [v]: val })}
+              />
+            ) : (
+              <input
+                className="p-input"
+                value={values[v] ?? ''}
+                placeholder={v}
+                spellCheck={false}
+                onChange={(e) => setValues({ ...values, [v]: e.target.value })}
+              />
+            )}
           </label>
         ))}
         <div className="p-preview">{preview}</div>
@@ -301,38 +337,101 @@ function renderFill(
   )
 }
 
+/** 可搜索变量下拉：聚焦列出全部已配置变量（「名称 = 值」），输入即子串过滤，选中取该变量的值填入；
+ *  仍可自由输入任意值。下拉用 fixed 定位，避免被外层滚动容器（p-menu）裁剪。 */
+function VarValueInput({ value, vars, onChange }: {
+  value: string
+  vars: PromptVar[]
+  onChange: (v: string) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const [query, setQuery] = useState('')
+  const wrapRef = useRef<HTMLDivElement>(null)
+  const inputRef = useRef<HTMLInputElement>(null)
+  const [popPos, setPopPos] = useState<{ left: number; top: number; width: number } | null>(null)
+
+  const filtered = filterVars(vars, query)
+
+  // 外点关闭
+  useEffect(() => {
+    if (!open) return
+    const onDown = (e: MouseEvent) => {
+      if (!wrapRef.current?.contains(e.target as Node)) setOpen(false)
+    }
+    document.addEventListener('mousedown', onDown)
+    return () => document.removeEventListener('mousedown', onDown)
+  }, [open])
+
+  const openPop = () => {
+    const r = inputRef.current?.getBoundingClientRect()
+    if (!r) return
+    setPopPos({ left: r.left, top: r.bottom + 4, width: Math.max(r.width, 260) })
+    setQuery('')
+    setOpen(true)
+  }
+
+  return (
+    <div ref={wrapRef} className="p-combo">
+      <input
+        ref={inputRef}
+        className="p-input"
+        value={value}
+        placeholder="下拉选变量取其值，或直接输入"
+        spellCheck={false}
+        onFocus={openPop}
+        onChange={(e) => { onChange(e.target.value); setQuery(e.target.value); setOpen(true) }}
+      />
+      {open && popPos && filtered.length > 0 && (
+        <div className="p-combo-pop" style={{ position: 'fixed', left: popPos.left, top: popPos.top, width: popPos.width }}>
+          {filtered.map((v) => (
+            <button
+              key={v.name}
+              type="button"
+              className="p-combo-item"
+              title={`用「${v.name}」的值填充`}
+              onClick={() => { onChange(v.value); setOpen(false) }}
+            >
+              <span className="p-combo-item__name">{v.name}</span>
+              <span className="p-combo-item__val">= {v.value}</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
 /** 新场景草稿（id 由保存时 uniqueId 生成）。 */
 function newDraft(): Scene {
   return { id: '', name: '', description: '', prompt: '', builtin: false, updatedAt: '' }
 }
 
-/** 场景管理弹窗：新增 / 编辑 / 删除，保存全部（PUT 全量替换）。 */
-function ManageModal({ scenes, onClose, onSaved }: {
+/** 管理弹窗：场景 / 变量库 两个页签。两者均为单步保存（保存修改/删除 = 立即 PUT 落盘）。
+ *  保存失败时草稿保留 + 错误横幅 + 底部「重试保存」；关闭时若任一页有未落盘修改先确认。 */
+function ManageModal({ scenes, vars, onClose, onSaved, onVarsSaved }: {
   scenes: Scene[]
+  vars: PromptVar[]
   onClose: () => void
   onSaved: (next: Scene[]) => void
+  onVarsSaved: (next: PromptVar[]) => void
 }) {
+  const [tab, setTab] = useState<'scenes' | 'vars'>('scenes')
+  const [varDirty, setVarDirty] = useState(false)
   const [drafts, setDrafts] = useState<Scene[]>(() => scenes.map((s) => ({ ...s })))
   const [sel, setSel] = useState<string | 'new' | null>(null) // null=列表视图
   const [banner, setBanner] = useState<{ ok: boolean; text: string } | null>(null)
   const [saving, setSaving] = useState(false)
+  const [sceneQuery, setSceneQuery] = useState('') // 场景列表搜索词
+
+  const dirty = hasDirtyScenes(scenes, drafts)
 
   const editing: Scene | null =
     sel === null ? null : sel === 'new' ? newDraft() : (drafts.find((d) => d.id === sel) ?? null)
 
-  const patch = (next: Scene) => {
-    if (sel === null) return
-    setDrafts((ds) => (sel === 'new' ? [...ds, next] : ds.map((d) => (d.id === sel ? next : d))))
-    if (sel === 'new') setSel(null) // 新建草稿入列后回到列表
-  }
-
-  const remove = (id: string) => {
-    setDrafts((ds) => ds.filter((d) => d.id !== id))
-    if (sel === id) setSel(null)
-  }
-
-  const saveAll = async () => {
-    const invalid = drafts.filter((d) => !validateScene(d))
+  /** 单步落盘：校验 → PUT → 反馈。target 由调用方显式传入（setDrafts 异步，闭包里的 drafts 可能陈旧）。 */
+  const persist = async (target: Scene[], okText = '已保存') => {
+    if (saving) return
+    const invalid = target.filter((d) => !validateScene(d))
     if (invalid.length > 0) {
       setBanner({ ok: false, text: `有 ${invalid.length} 个场景未填名称/提示词或 id 非法，请先修正` })
       return
@@ -340,10 +439,10 @@ function ManageModal({ scenes, onClose, onSaved }: {
     setSaving(true)
     setBanner(null)
     try {
-      const saved = await saveScenes(drafts)
+      const saved = await saveScenes(target)
       onSaved(saved)
       setDrafts(saved.map((s) => ({ ...s })))
-      setBanner({ ok: true, text: '已保存' })
+      setBanner({ ok: true, text: okText })
     } catch (e) {
       setBanner({ ok: false, text: `保存失败：${e instanceof Error ? e.message : String(e)}` })
     } finally {
@@ -351,92 +450,353 @@ function ManageModal({ scenes, onClose, onSaved }: {
     }
   }
 
+  /** 编辑器保存：写回草稿 → 回列表 → 立即落盘（单步，无需再点任何按钮）。 */
+  const saveEdit = (next: Scene) => {
+    if (sel === null || saving) return
+    const nextDrafts = applyDraftEdit(drafts, sel, next)
+    setDrafts(nextDrafts)
+    setSel(null)
+    void persist(nextDrafts)
+  }
+
+  /** 删除：确认后移除并立即落盘（单步）。 */
+  const remove = (id: string) => {
+    if (!window.confirm('确定删除这个场景吗？删除后立即生效，不可撤销。')) return
+    const nextDrafts = applyDraftRemove(drafts, id)
+    setDrafts(nextDrafts)
+    if (sel === id) setSel(null)
+    void persist(nextDrafts, '已删除并保存')
+  }
+
+  /** 关闭守卫：场景或变量草稿与磁盘不一致（上次保存失败）时确认，防静默丢改动。 */
+  const handleClose = () => {
+    if (
+      (dirty || varDirty)
+      && !window.confirm('有未保存的修改（可能是上次保存失败），关闭将丢弃这些修改。确定关闭吗？')
+    ) return
+    onClose()
+  }
+
   return (
-    <div className="p-modal-mask" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose() }}>
-      <div className="p-modal" role="dialog" aria-label="管理提示词场景">
+    <div className="p-modal-mask" onMouseDown={(e) => { if (e.target === e.currentTarget) handleClose() }}>
+      <div className="p-modal" role="dialog" aria-label="管理提示词场景与变量">
         <div className="p-modal-head">
-          <h3 className="p-modal-title">管理提示词场景</h3>
-          <button type="button" className="p-btn p-btn--sm" title="关闭" onClick={onClose}>
+          <h3 className="p-modal-title">{tab === 'scenes' ? '管理提示词场景' : '管理变量库'}</h3>
+          <button type="button" className="p-btn p-btn--sm" title="关闭" onClick={handleClose}>
             <IconClose size={14} />
           </button>
         </div>
 
-        {banner ? (
-          <div className={banner.ok ? 'p-banner p-banner--ok' : 'p-banner p-banner--err'}>{banner.text}</div>
-        ) : null}
+        <div className="p-tabs" role="tablist">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab === 'scenes'}
+            className={tab === 'scenes' ? 'p-tab p-tab--on' : 'p-tab'}
+            onClick={() => setTab('scenes')}
+          >
+            场景
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab === 'vars'}
+            className={tab === 'vars' ? 'p-tab p-tab--on' : 'p-tab'}
+            onClick={() => setTab('vars')}
+          >
+            变量库
+          </button>
+        </div>
 
-        {editing ? (
-          <SceneEditor
-            scene={editing}
-            existingIds={drafts.map((d) => d.id)}
-            onCancel={() => setSel(null)}
-            onSave={patch}
-          />
-        ) : (
+        {tab === 'scenes' ? (
           <>
-            <div className="p-manage-list">
-              {drafts.map((d) => {
-                const vars = extractVariables(d.prompt)
-                return (
-                  <div key={d.id} className="p-manage-row">
-                    <div className="p-manage-main">
-                      <span className="p-manage-name">
-                        {d.name || <em className="p-empty-inline">（未命名）</em>}
-                        {d.builtin ? <span className="p-tag">内置</span> : null}
-                      </span>
-                      {d.description ? <span className="p-manage-desc">{d.description}</span> : null}
-                      {vars.length > 0 ? (
-                        <span className="p-vars">
-                          {vars.map((v) => (
-                            <code key={v} className="p-var">{`{${v}}`}</code>
-                          ))}
-                        </span>
-                      ) : null}
-                    </div>
-                    <div className="p-manage-actions">
-                      <button type="button" className="p-btn p-btn--sm" onClick={() => setSel(d.id)}>编辑</button>
-                      {d.builtin ? null : (
-                        <button
-                          type="button"
-                          className="p-btn p-btn--sm p-btn--danger"
-                          title="删除场景"
-                          onClick={() => remove(d.id)}
-                        >
-                          <IconTrash size={13} />
-                        </button>
-                      )}
-                    </div>
+            {banner ? (
+              <div className={banner.ok ? 'p-banner p-banner--ok' : 'p-banner p-banner--err'}>{banner.text}</div>
+            ) : null}
+
+            {editing ? (
+              <SceneEditor
+                scene={editing}
+                existingIds={drafts.map((d) => d.id)}
+                onCancel={() => setSel(null)}
+                onSave={saveEdit}
+              />
+            ) : (
+              <>
+                {drafts.length > 0 ? (
+                  <input
+                    className="p-input p-search"
+                    value={sceneQuery}
+                    placeholder="搜索场景（名称/描述/提示词）"
+                    spellCheck={false}
+                    onChange={(e) => setSceneQuery(e.target.value)}
+                  />
+                ) : null}
+                <div className="p-manage-list">
+                  {filterScenes(drafts, sceneQuery).map((d) => {
+                    const varsInPrompt = extractVariables(d.prompt)
+                    return (
+                      <div key={d.id} className="p-manage-row">
+                        <div className="p-manage-main">
+                          <span className="p-manage-name">
+                            {d.name || <em className="p-empty-inline">（未命名）</em>}
+                            {d.builtin ? <span className="p-tag">内置</span> : null}
+                          </span>
+                          {d.description ? <span className="p-manage-desc">{d.description}</span> : null}
+                          {varsInPrompt.length > 0 ? (
+                            <span className="p-vars">
+                              {varsInPrompt.map((v) => (
+                                <code key={v} className="p-var">{`{${v}}`}</code>
+                              ))}
+                            </span>
+                          ) : null}
+                        </div>
+                        <div className="p-manage-actions">
+                          <button type="button" className="p-btn p-btn--sm" onClick={() => setSel(d.id)}>编辑</button>
+                          {d.builtin ? null : (
+                            <button
+                              type="button"
+                              className="p-btn p-btn--sm p-btn--danger"
+                              title="删除场景"
+                              onClick={() => remove(d.id)}
+                            >
+                              <IconTrash size={13} />
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    )
+                  })}
+                  {drafts.length === 0 ? <div className="p-empty">还没有场景</div> : null}
+                  {drafts.length > 0 && filterScenes(drafts, sceneQuery).length === 0 ? (
+                    <div className="p-empty">没有匹配的场景</div>
+                  ) : null}
+                </div>
+                <div className="p-row" style={{ justifyContent: 'space-between' }}>
+                  <button type="button" className="p-btn p-btn--sm" onClick={() => setSel('new')}>
+                    <IconPlus size={12} />
+                    <span>新增场景</span>
+                  </button>
+                  <div className="p-row">
+                    <button type="button" className="p-btn p-btn--sm" onClick={handleClose}>关闭</button>
+                    {banner && !banner.ok && dirty ? (
+                      <button
+                        type="button"
+                        className="p-btn p-btn--sm p-btn--primary"
+                        disabled={saving}
+                        onClick={() => void persist(drafts)}
+                      >
+                        {saving ? '保存中…' : '重试保存'}
+                      </button>
+                    ) : null}
                   </div>
-                )
-              })}
-              {drafts.length === 0 ? <div className="p-empty">还没有场景</div> : null}
-            </div>
-            <div className="p-row" style={{ justifyContent: 'space-between' }}>
-              <button type="button" className="p-btn p-btn--sm" onClick={() => setSel('new')}>
-                <IconPlus size={12} />
-                <span>新增场景</span>
-              </button>
-              <div className="p-row">
-                <button type="button" className="p-btn p-btn--sm" onClick={onClose}>关闭</button>
-                <button
-                  type="button"
-                  className="p-btn p-btn--sm p-btn--primary"
-                  disabled={saving}
-                  onClick={() => void saveAll()}
-                >
-                  {saving ? '保存中…' : '保存全部'}
-                </button>
-              </div>
-            </div>
-            <div className="p-hint">内置场景可编辑（以你的修改为准），不可删除；删除后重新载入插件会恢复 seed。</div>
+                </div>
+                <div className="p-hint">
+                  保存修改 / 删除会立即写入磁盘；删除前需确认。保存失败时草稿保留，可点「重试保存」。
+                  内置场景可编辑（以你的修改为准），不可删除；删除后重新载入插件会恢复 seed。
+                  在「变量库」页签可配置可复用的 {'{变量}'} 候选值。
+                </div>
+              </>
+            )}
           </>
+        ) : (
+          <VarManager
+            vars={vars}
+            onSaved={onVarsSaved}
+            onClose={handleClose}
+            onDirtyChange={setVarDirty}
+          />
         )}
       </div>
     </div>
   )
 }
 
-/** 单场景编辑表单（新增/编辑共用；保存写回列表草稿，未落盘直到「保存全部」）。 */
+/** 变量库管理：新增 / 编辑 / 删除，单步保存（与场景页同模式）。全局共享、名称大小写不敏感唯一。 */
+function VarManager({ vars, onSaved, onClose, onDirtyChange }: {
+  vars: PromptVar[]
+  onSaved: (next: PromptVar[]) => void
+  onClose: () => void
+  onDirtyChange: (dirty: boolean) => void
+}) {
+  const [drafts, setDrafts] = useState<PromptVar[]>(() => (vars ?? []).map((v) => ({ ...v })))
+  const [sel, setSel] = useState<string | 'new' | null>(null) // null=列表视图
+  const [banner, setBanner] = useState<{ ok: boolean; text: string } | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [varQuery, setVarQuery] = useState('') // 变量列表搜索词
+
+  const dirty = hasDirtyVars(vars, drafts)
+  useEffect(() => { onDirtyChange(dirty) }, [dirty, onDirtyChange])
+
+  const editing: PromptVar | null =
+    sel === null
+      ? null
+      : sel === 'new'
+        ? { name: '', value: '', updatedAt: '' }
+        : (drafts.find((d) => d.name.toLowerCase() === sel.toLowerCase()) ?? null)
+
+  /** 单步落盘：校验 → PUT → 反馈（与场景页同款）。 */
+  const persist = async (target: PromptVar[], okText = '已保存') => {
+    if (saving) return
+    const invalid = target.filter((d) => !validateVar(d))
+    if (invalid.length > 0) {
+      setBanner({ ok: false, text: '有变量未填名称或没有候选值，请先修正' })
+      return
+    }
+    setSaving(true)
+    setBanner(null)
+    try {
+      const saved = await saveVars(target)
+      onSaved(saved)
+      setDrafts(saved.map((v) => ({ ...v })))
+      setBanner({ ok: true, text: okText })
+    } catch (e) {
+      setBanner({ ok: false, text: `保存失败：${e instanceof Error ? e.message : String(e)}` })
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const saveEdit = (next: PromptVar) => {
+    if (sel === null || saving) return
+    const nextDrafts = sel === 'new'
+      ? [...drafts, next]
+      : drafts.map((d) => (d.name.toLowerCase() === sel.toLowerCase() ? next : d))
+    if (hasDuplicateVarNames(nextDrafts)) {
+      setBanner({ ok: false, text: '变量名重复（不区分大小写），请修改后重试' })
+      return // 不写草稿，编辑器保持打开让用户改名
+    }
+    setDrafts(nextDrafts)
+    setSel(null)
+    void persist(nextDrafts)
+  }
+
+  const remove = (name: string) => {
+    if (!window.confirm(`确定删除变量「${name}」吗？删除后立即生效，不可撤销。`)) return
+    const nextDrafts = drafts.filter((d) => d.name.toLowerCase() !== name.toLowerCase())
+    setDrafts(nextDrafts)
+    if (sel !== null && sel !== 'new' && sel.toLowerCase() === name.toLowerCase()) setSel(null)
+    void persist(nextDrafts, '已删除并保存')
+  }
+
+  return (
+    <>
+      {banner ? (
+        <div className={banner.ok ? 'p-banner p-banner--ok' : 'p-banner p-banner--err'}>{banner.text}</div>
+      ) : null}
+
+      {editing ? (
+        <VarEditor v={editing} onCancel={() => setSel(null)} onSave={saveEdit} />
+      ) : (
+        <>
+          {drafts.length > 0 ? (
+            <input
+              className="p-input p-search"
+              value={varQuery}
+              placeholder="搜索变量（名称/值）"
+              spellCheck={false}
+              onChange={(e) => setVarQuery(e.target.value)}
+            />
+          ) : null}
+          <div className="p-manage-list">
+            {filterVars(drafts, varQuery).map((v) => (
+              <div key={v.name} className="p-manage-row">
+                <div className="p-manage-main">
+                  <span className="p-manage-name">{v.name}</span>
+                  {v.value ? (
+                    <span className="p-manage-desc">= {v.value}</span>
+                  ) : null}
+                </div>
+                <div className="p-manage-actions">
+                  <button type="button" className="p-btn p-btn--sm" onClick={() => setSel(v.name)}>编辑</button>
+                  <button
+                    type="button"
+                    className="p-btn p-btn--sm p-btn--danger"
+                    title="删除变量"
+                    onClick={() => remove(v.name)}
+                  >
+                    <IconTrash size={13} />
+                  </button>
+                </div>
+              </div>
+            ))}
+            {drafts.length === 0 ? <div className="p-empty">还没有变量，先添加一个</div> : null}
+            {drafts.length > 0 && filterVars(drafts, varQuery).length === 0 ? (
+              <div className="p-empty">没有匹配的变量</div>
+            ) : null}
+          </div>
+          <div className="p-row" style={{ justifyContent: 'space-between' }}>
+            <button type="button" className="p-btn p-btn--sm" onClick={() => setSel('new')}>
+              <IconPlus size={12} />
+              <span>新增变量</span>
+            </button>
+            <div className="p-row">
+              <button type="button" className="p-btn p-btn--sm" onClick={onClose}>关闭</button>
+              {banner && !banner.ok && dirty ? (
+                <button
+                  type="button"
+                  className="p-btn p-btn--sm p-btn--primary"
+                  disabled={saving}
+                  onClick={() => void persist(drafts)}
+                >
+                  {saving ? '保存中…' : '重试保存'}
+                </button>
+              ) : null}
+            </div>
+          </div>
+          <div className="p-hint">
+            变量全局共享：任意场景的填充面板里，每个 {'{变量}'} 下拉列出全部已配置变量（名称 = 值），选中即用该变量的值填入；也可手动输入。变量名不区分大小写且不可重复；删除前会确认。
+          </div>
+        </>
+      )}
+    </>
+  )
+}
+
+/** 单变量编辑表单（新增/编辑共用；「保存修改」由 VarManager 单步落盘）。 */
+function VarEditor({ v, onCancel, onSave }: {
+  v: PromptVar
+  onCancel: () => void
+  onSave: (next: PromptVar) => void
+}) {
+  const [name, setName] = useState(v.name)
+  const [value, setValue] = useState(v.value)
+
+  const submit = () => onSave({ name: name.trim(), value: value.trim(), updatedAt: v.updatedAt })
+
+  return (
+    <>
+      <label className="p-form-row">
+        <span className="p-form-label">变量名 *（如 项目 / 范围，不区分大小写）</span>
+        <input className="p-input" value={name} spellCheck={false} onChange={(e) => setName(e.target.value)} />
+      </label>
+      <label className="p-form-row">
+        <span className="p-form-label">值 *（填充时点选此变量即插入该值）</span>
+        <input
+          className="p-input"
+          value={value}
+          placeholder="如 iobs_pro / 多租户缓存服务"
+          spellCheck={false}
+          onChange={(e) => setValue(e.target.value)}
+        />
+      </label>
+      <div className="p-hint">改一处全局生效：所有场景填充时都能选到这个变量。</div>
+      <div className="p-row" style={{ justifyContent: 'flex-end' }}>
+        <button type="button" className="p-btn p-btn--sm" onClick={onCancel}>取消</button>
+        <button
+          type="button"
+          className="p-btn p-btn--sm p-btn--primary"
+          disabled={!name.trim() || !value.trim()}
+          onClick={submit}
+        >
+          保存修改
+        </button>
+      </div>
+    </>
+  )
+}
+
+/** 单场景编辑表单（新增/编辑共用；「保存修改」由 ManageModal 单步落盘）。 */
 function SceneEditor({ scene, existingIds, onCancel, onSave }: {
   scene: Scene
   existingIds: string[]
@@ -495,7 +855,7 @@ function SceneEditor({ scene, existingIds, onCancel, onSave }: {
           disabled={!name.trim() || !prompt.trim()}
           onClick={submit}
         >
-          写入列表
+          保存修改
         </button>
       </div>
     </>

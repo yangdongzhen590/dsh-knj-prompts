@@ -4,7 +4,7 @@
  * 非空白自动开新会话再填，微调即可发送）。宿主 API 结论见 PROBE.md。
  */
 import { createElement as h } from 'react'
-import { injectPromptStyles } from './styles.ts'
+import { injectPromptStyles, removePromptStyles } from './styles.ts'
 import { ScenePicker, type ScenePickerProps } from './ScenePicker.tsx'
 
 export const name = 'dsh-knj-prompts'
@@ -65,11 +65,14 @@ export function apply(ctx: ClientContext): void {
       return h(ScenePicker, {
         sessionId: p.sessionId,
         session: p.session,
-        input: p.input,
         inputActions: p.inputActions,
         workspaces: workspacesGet,
       })
     })
-    return () => { dispose() }
+    return () => {
+      dispose()
+      // 卸载/HMR 时移除注入的 <style>，避免旧版本 CSS 常驻 DOM
+      removePromptStyles()
+    }
   }, 'dsh-knj-prompts: input.right slot')
 }

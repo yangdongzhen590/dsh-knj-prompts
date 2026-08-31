@@ -6,10 +6,27 @@ export interface Scene {
   prompt: string
   builtin: boolean
   updatedAt: string
+  /**
+   * seed 基线文案（内置场景专用）：prompt === seedPrompt 表示用户从未编辑过，
+   * 插件升级 seed 时可安全更新；不等则保留用户版本。旧格式文件无此字段，
+   * 由 SceneStore 按 EPOCH updatedAt 迁移推断。
+   */
+  seedPrompt?: string
 }
 
 /** 场景 id 只允许 SAFE_ID 字符集（客户端与服务端共用）。 */
 export const SAFE_ID = /^[a-zA-Z0-9\u4e00-\u9fff][a-zA-Z0-9\u4e00-\u9fff-]*$/
+
+/**
+ * 全局可复用变量（变量库/环境变量）：名称 → 单个值（NAME=VALUE 语义）。
+ * name 为唯一键（大小写不敏感）；填充场景时下拉选择变量，取其 value 填入占位符。
+ * 旧格式 values[] 由 VarStore.load 自动迁移为 value（取第一个非空值）。
+ */
+export interface PromptVar {
+  name: string
+  value: string
+  updatedAt: string
+}
 
 /** 内置场景 seed（首版 4 个）。updatedAt 用 epoch 标记"未编辑"。 */
 export const SEED_SCENES: Scene[] = [
