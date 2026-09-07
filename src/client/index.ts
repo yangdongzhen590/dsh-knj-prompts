@@ -17,6 +17,12 @@ interface SlotsLike {
     order?: number
     priority?: number
   }, component: (props: unknown) => unknown): () => void
+  /**
+   * 0.1.2+ 宿主：等待插槽所属条目声明后再执行注册回调（conversation.* 槽随
+   * 会话视图懒加载挂载，启动即 register 会被判「未声明」而拖垮插件装配）。
+   * 新老宿主通用：老宿主无此方法时回退为直接 register。
+   */
+  inject?(name: string, callback: () => () => void): () => void
 }
 
 /** 宿主工作区服务最小面：startSession = 官方「新建会话」动作（连接当前工作区的空白会话并导航）。 */
@@ -46,6 +52,7 @@ export function apply(ctx: ClientContext): void {
   ctx.effect(() => {
     injectPromptStyles()
     if (!ctx.slots) return
+    const slots = ctx.slots
     /** 懒解析：点击场景时再读（此时宿主已完整 boot）。cordis 服务用 ctx.get(name)
      *  访问——ctx.workspaces 属性只在 fiber 声明了 inject 时才存在。 */
     const workspacesGet = (): WorkspacesLike | undefined => {
@@ -56,19 +63,24 @@ export function apply(ctx: ClientContext): void {
         return undefined
       }
     }
-    const dispose = ctx.slots.register({
+    const registerPicker = (): (() => void) => slots.register({
       name: 'conversation.input.right',
       id: 'knj-prompts',
       order: 100,
     }, (props) => {
       const p = props as ScenePickerProps
       return h(ScenePicker, {
-        sessionId: p.sessionId,
         session: p.session,
         inputActions: p.inputActions,
         workspaces: workspacesGet,
       })
     })
+    // 0.1.2+ 宿主：conversation.input.right 属 session 作用域懒加载槽，
+    // 必须等宿主声明后再注册（slots.inject 模式，与 dsh-better-sidebar 等一致）；
+    // 老宿主无 inject 时回退为直接 register，保持跨版本兼容。
+    const dispose = typeof slots.inject === 'function'
+      ? slots.inject('conversation.input.right', registerPicker)
+      : registerPicker()
     return () => {
       dispose()
       // 卸载/HMR 时移除注入的 <style>，避免旧版本 CSS 常驻 DOM

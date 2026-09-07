@@ -2,14 +2,14 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createRequire } from 'node:module'
 const require = createRequire(import.meta.url)
 const { SceneStore } = require('../lib/store.js')
 const { VarStore } = require('../lib/varstore.js')
-const { mountPromptRoutes, mountVarRoutes } = require('../lib/routes.js')
+const { mountPackageRoutes, mountPromptRoutes, mountVarRoutes } = require('../lib/routes.js')
 
 function startServer() {
   const dir = mkdtempSync(join(tmpdir(), 'knj-prompts-routes-'))
@@ -21,12 +21,14 @@ function startServer() {
   }
   const disposeScenes = mountPromptRoutes(fakeHost, store)
   const disposeVars = mountVarRoutes(fakeHost, varStore)
+  const importsDir = join(dir, 'imports')
+  const disposePackages = mountPackageRoutes(fakeHost, importsDir)
   const server = createServer((req, res) => {
     const route = routes.find((r) => r.kind === 'exact' && r.path === req.url.split('?')[0])
     if (route) return void route.handler(req, res)
     res.writeHead(404); res.end('{}')
   })
-  return { server, store, varStore, dir, dispose: () => { disposeScenes(); disposeVars() } }
+  return { server, store, varStore, dir, importsDir, dispose: () => { disposeScenes(); disposeVars(); disposePackages() } }
 }
 
 function request(port, method, path, headers = {}, body) {
@@ -44,6 +46,43 @@ function request(port, method, path, headers = {}, body) {
   })
 }
 
+test('POST /api/knj-prompts/imports stages a valid ZIP and returns its real local path', async (t) => {
+  const s = startServer()
+  t.after(() => { s.server.close(); s.dispose(); rmSync(s.dir, { recursive: true, force: true }) })
+  await new Promise((r) => s.server.listen(0, '127.0.0.1', r))
+  const port = s.server.address().port
+  const res = await request(port, 'POST', '/api/knj-prompts/imports', {
+    origin: `http://127.0.0.1:${port}`, 'content-type': 'application/zip', 'x-file-name': encodeURIComponent('客户场景.zip'),
+  }, Buffer.from([0x50, 0x4b, 0x05, 0x06]))
+  const data = JSON.parse(res.body)
+  assert.equal(res.status, 201, res.body)
+  assert.equal(data.path.startsWith(s.importsDir), true)
+  assert.equal(existsSync(data.path), true)
+})
+
+test('POST /api/knj-prompts/imports rejects non-ZIP content and leaves no staged file', async () => {
+  const s = startServer()
+  await new Promise((r) => s.server.listen(0, '127.0.0.1', r))
+  const port = s.server.address().port
+  const headers = { origin: `http://127.0.0.1:${port}`, 'content-type': 'application/zip', 'x-file-name': 'not-a-zip.zip' }
+  const res = await request(port, 'POST', '/api/knj-prompts/imports', headers, 'hello')
+  assert.equal(res.status, 400)
+  assert.equal(existsSync(s.importsDir) ? readdirSync(s.importsDir).length : 0, 0)
+  s.server.close(); s.dispose(); rmSync(s.dir, { recursive: true, force: true })
+})
+
+test('POST /api/knj-prompts/imports rejects cross-scheme origin before staging', async () => {
+  const s = startServer()
+  await new Promise((r) => s.server.listen(0, '127.0.0.1', r))
+  const port = s.server.address().port
+  const res = await request(port, 'POST', '/api/knj-prompts/imports', {
+    origin: `https://127.0.0.1:${port}`, 'content-type': 'application/zip', 'x-file-name': 'scene.zip',
+  }, Buffer.from([0x50, 0x4b, 0x05, 0x06]))
+  assert.equal(res.status, 403)
+  assert.equal(existsSync(s.importsDir), false)
+  s.server.close(); s.dispose(); rmSync(s.dir, { recursive: true, force: true })
+})
+
 test('GET /api/knj-prompts/scenes 返回 seed 场景', async () => {
   const s = startServer()
   await new Promise((r) => s.server.listen(0, '127.0.0.1', r))
@@ -51,7 +90,7 @@ test('GET /api/knj-prompts/scenes 返回 seed 场景', async () => {
   const res = await request(port, 'GET', '/api/knj-prompts/scenes')
   const data = JSON.parse(res.body)
   assert.equal(res.status, 200)
-  assert.equal(data.scenes.length, 4)
+  assert.equal(data.scenes.length, 6)
   s.server.close(); s.dispose(); rmSync(s.dir, { recursive: true, force: true })
 })
 

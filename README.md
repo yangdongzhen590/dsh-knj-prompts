@@ -10,18 +10,41 @@ DSH 提示词场景插件：输入框右侧「✦ 提示词」下拉选场景 �
 - 当前会话为空白会话 → 原地填充草稿；已有对话 → 自动开新会话（官方 New Session 通道）后填充
 - 「管理场景…」弹窗：新增 / 编辑 / 删除场景（内置场景可编辑、不可删除），「保存全部」落盘
 - 场景存储：`<DSH_HOME>/knj-prompts/scenes.json`（原子写、损坏自动备份重建、内置 seed 合并）
+- 场景编辑器提供默认折叠的「场景包操作说明」Markdown；旧数据缺该字段时自动视为空字符串
+- 内置「导出场景包」与「安装场景包」场景：分别引导 AI 使用随插件提供的 exporter / installer skill
+
+## 场景包 MVP
+
+场景包是**一个普通场景**的可迁移 ZIP。包内只允许携带该场景、其 Markdown 操作说明、嵌入 skill 和可选素材；不包含普通 DSH 插件代码，也不复制源机器的运行配置值。
+
+```text
+<scene-id>.dshscene.zip
+├─ manifest.json
+├─ scene.json
+├─ README.md
+├─ skills/          # 可选：<skill-id>/SKILL.md 及其文件
+└─ materials/       # 可选：操作说明中列出的素材
+```
+
+- 操作说明是依赖、素材、配置模板与验证步骤的唯一真源，不依赖额外结构化依赖字段。
+- 插件首启时从本包 `skills/` 复制 `scene-package-exporter` 和 `scene-package-installer` 到 `<DSH_HOME>/skills/`；已有同名目录一律保留，绝不覆盖或合并。
+- 选择「安装场景包」会打开文件选择器，仅接受 ZIP。插件将其上传暂存到 `<DSH_HOME>/knj-prompts/imports/` 并在安装会话草稿中写入服务器返回的真实路径。
+- 插件**不会**解压 ZIP、安装 skill、写运行配置或执行包内内容。这些动作由 AI 通过 installer skill 完成：先预检、展示计划并询问当前环境配置；任一嵌入 skill 在目标根目录同名时整体阻断，确认前和发生冲突时均不得部分写入。
+- V1 不支持多场景包、覆盖/合并、远程仓库、签名、依赖图、更新同步或自动配置发现。
 
 ## 安装（web profile）
 
 ```powershell
 # 在插件目录
-npm run check && npm run build && npm run build:client && npm pack
+npm.cmd run typecheck && npm.cmd run check:client && npm.cmd run build && npm.cmd run build:client && npm pack
 # 在 web profile 的 package.json 里把依赖指向新 tgz 后重装
 ```
 
 ## 开发
 
-- 纯函数与决策表：`src/client/engine.ts`（`node --test` 直接跑 .mjs 测试）
-- 服务端（场景存储 + `/api/knj-prompts/scenes` GET/PUT）：`src/{store,routes}.ts`
-- 客户端（ScenePicker 下拉 / 变量面板 / 管理弹窗）：`src/client/ScenePicker.tsx`
+- 纯函数与决策表：`src/client/engine.ts`（`node --test engine.test.mjs`）
+- 服务端（场景/变量存储、ZIP 暂存）：`src/{store,varstore,routes,scene-package}.ts`
+- 客户端（ScenePicker 下拉 / ZIP 选择上传 / 变量面板 / 管理弹窗）：`src/client/ScenePicker.tsx`
+- Bootstrap skill：`skills/{scene-package-exporter,scene-package-installer}/SKILL.md`
+- 关键验证：`node --test engine.test.mjs bootstrap-skills.test.mjs scene-package.test.mjs store.test.mjs`
 - 宿主 API 事实清单：[PROBE.md](./PROBE.md)（改 inject 或 props 前必读）

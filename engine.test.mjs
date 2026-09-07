@@ -2,6 +2,7 @@
 // 场景引擎纯函数红绿测试（Node 24 原生 TS strip 直接 import 源文件）
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { SEED_SCENES } from './src/types.ts'
 import {
   extractVariables,
   fillPrompt,
@@ -14,6 +15,8 @@ import {
   matchesFuzzy,
   filterScenes,
   filterVars,
+  buildSceneEdit,
+  buildVarEdit,
 } from './src/client/engine.ts'
 
 test('extractVariables 提取去重', () => {
@@ -24,13 +27,25 @@ test('fillPrompt 替换并保留缺失变量', () => {
   assert.equal(fillPrompt('查 {主题} / {范围}', { 主题: '知识库' }), '查 知识库 / {范围}')
 })
 
-test('validateScene 校验', () => {
+test('validateScene 校验与场景包说明兼容', () => {
   const valid = { id: 'a-b', name: 'n', description: '', prompt: 'p', builtin: false, updatedAt: '' }
-  assert.ok(validateScene(valid))
+  assert.deepEqual(validateScene(valid), { ...valid, operationManual: '' })
+  assert.deepEqual(validateScene({ ...valid, operationManual: '# 安装说明' }), { ...valid, operationManual: '# 安装说明' })
+  assert.equal(validateScene({ ...valid, operationManual: 1 }), null)
   assert.equal(validateScene({ ...valid, id: 'bad id' }), null)
   assert.equal(validateScene({ ...valid, name: '' }), null)
   assert.equal(validateScene({ ...valid, prompt: '  ' }), null)
   assert.equal(validateScene(null), null)
+})
+
+test('场景包内置场景引导 AI 使用 bootstrap skills', () => {
+  const exporter = SEED_SCENES.find((scene) => scene.id === 'export-scene-package')
+  const installer = SEED_SCENES.find((scene) => scene.id === 'install-scene-package')
+  assert.ok(exporter)
+  assert.ok(installer)
+  assert.match(exporter.prompt, /scene-package-exporter/)
+  assert.match(installer.prompt, /scene-package-installer/)
+  assert.match(installer.prompt, /{场景包ZIP路径}/)
 })
 
 test('sanitizeId 净化', () => {
@@ -131,4 +146,31 @@ test('filterVars 按名称/值过滤', () => {
   assert.equal(filterVars(vars, '代码审查').length, 1)
   assert.equal(filterVars(vars, 'project').length, 0)
   assert.equal(filterVars(vars, '').length, 2)
+})
+
+test('buildSceneEdit 表单合并与 id 生成（固定底部操作栏的保存入口）', () => {
+  const base = { id: 'a', name: 'A', description: 'd', prompt: 'p', operationManual: 'old', builtin: false, updatedAt: 't' }
+  // 编辑已有场景：保留原 id，业务字段整体替换
+  assert.deepEqual(
+    buildSceneEdit(base, { name: 'A2', description: 'd2', prompt: 'p2', operationManual: 'new' }, ['a', 'b']),
+    { id: 'a', name: 'A2', description: 'd2', prompt: 'p2', operationManual: 'new', builtin: false, updatedAt: 't' },
+  )
+  // 新增场景：base.id 为空 → 用名称净化生成不冲突 id（uniqueId 逻辑）
+  const created = buildSceneEdit(
+    { id: '', name: '', description: '', prompt: '', operationManual: '', builtin: false, updatedAt: '' },
+    { name: '知识检索 场景!', description: '', prompt: 'p', operationManual: '# 手册' },
+    ['知识检索-场景'],
+  )
+  assert.equal(created.id, '知识检索-场景-2')
+  assert.equal(created.name, '知识检索 场景!') // 名称原样保留，仅 id 净化
+  assert.equal(created.prompt, 'p')
+  assert.equal(created.operationManual, '# 手册')
+  assert.equal(created.builtin, false)
+})
+
+test('buildVarEdit 变量表单合并与去空白', () => {
+  const base = { name: 'x', value: 'v', updatedAt: 't' }
+  assert.deepEqual(buildVarEdit(base, { name: ' 需求 ', value: ' 1 ' }), { name: '需求', value: '1', updatedAt: 't' })
+  // 新增（空 base）：trim 后写入
+  assert.deepEqual(buildVarEdit({ name: '', value: '', updatedAt: '' }, { name: '范围', value: '全局' }), { name: '范围', value: '全局', updatedAt: '' })
 })

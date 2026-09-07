@@ -2,7 +2,28 @@
 // Task 4 场景应用决策 + 新增 id 去重 + 挂起填充资格（红绿测试：Node 24 原生 TS strip 直接 import 源文件）
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { resolveSceneAction, uniqueId, isPendingFillEligible, hasDirtyScenes, applyDraftEdit, applyDraftRemove, PENDING_TTL_MS, PENDING_ARRIVAL_MS } from './engine.ts'
+import { readFile } from 'node:fs/promises'
+import { buildScenePackageExportDraft, resolveSceneAction, uniqueId, isPendingFillEligible, hasDirtyScenes, applyDraftEdit, applyDraftRemove, PENDING_TTL_MS, PENDING_ARRIVAL_MS } from './engine.ts'
+
+test('ScenePicker 在当前宿主未注入 InputZone owner share 时原地填入草稿', async () => {
+  const source = await readFile(new URL('./ScenePicker.tsx', import.meta.url), 'utf8')
+  assert.match(source, /const sessionBlank = props\.session\?\.blank/)
+  assert.match(source, /if \(sessionBlank === undefined\) \{\s*props\.inputActions\?\.setDraft\(text\)\s*return\s*\}/s)
+})
+
+test('ScenePicker 的导出选择仅列出普通场景，点击后将选中场景内容交给 exporter', async () => {
+  const source = await readFile(new URL('./ScenePicker.tsx', import.meta.url), 'utf8')
+  assert.match(source, /type PickerMode = 'menu' \| 'fill' \| 'export-select'/)
+  assert.match(source, /if \(s\.id === 'export-scene-package'\) \{\s*setMenuQuery\(''\)\s*setMode\('export-select'\)\s*return\s*\}/s)
+  assert.match(source, /renderExportSelection\(scenes, menuQuery, setMenuQuery, exportScene\)/)
+  assert.match(source, /scenes\.filter\(\(scene\) => !scene\.builtin\)/)
+
+  const ordinary = { id: 'my-scene', name: '我的场景', description: '场景描述', prompt: '执行 {任务}', operationManual: '# 操作', builtin: false, updatedAt: '' }
+  const draft = buildScenePackageExportDraft('请调用 exporter。', ordinary)
+  assert.match(draft, /"id":"my-scene"/)
+  assert.match(draft, /"operationManual":"# 操作"/)
+  assert.doesNotMatch(draft, /先询问我要导出的场景/)
+})
 
 test('resolveSceneAction 决策表', () => {
   // 空白会话：无论有没有新建通道，都原地填充
@@ -43,8 +64,8 @@ test('isPendingFillEligible 挂起填充资格（到达窗口 + TTL + 会话差�
 
 test('hasDirtyScenes 管理弹窗脏检查（关闭丢弃守卫用）', () => {
   const base = [
-    { id: 'a', name: 'A', description: 'd1', prompt: 'p1', builtin: true, updatedAt: 't1' },
-    { id: 'b', name: 'B', description: 'd2', prompt: 'p2', builtin: false, updatedAt: 't2' },
+    { id: 'a', name: 'A', description: 'd1', prompt: 'p1', operationManual: '', builtin: true, updatedAt: 't1' },
+    { id: 'b', name: 'B', description: 'd2', prompt: 'p2', operationManual: '', builtin: false, updatedAt: 't2' },
   ]
   // 业务字段相同（仅 updatedAt 不同，如服务器落盘刷新时间戳）→ 不算未保存修改
   assert.equal(hasDirtyScenes(base, base.map((s) => ({ ...s, updatedAt: 'newer' }))), false)
@@ -54,8 +75,10 @@ test('hasDirtyScenes 管理弹窗脏检查（关闭丢弃守卫用）', () => {
   assert.equal(hasDirtyScenes(base, [{ ...base[0], name: 'A2' }, { ...base[1] }]), true)
   assert.equal(hasDirtyScenes(base, [{ ...base[0], description: 'dd' }, { ...base[1] }]), true)
   assert.equal(hasDirtyScenes(base, [{ ...base[0] }, { ...base[1], prompt: 'p3' }]), true)
+  // 改场景包操作说明 → 脏
+  assert.equal(hasDirtyScenes(base, [{ ...base[0], operationManual: '# 新说明' }, { ...base[1] }]), true)
   // 新增 / 删除 → 脏
-  assert.equal(hasDirtyScenes(base, [...base, { id: 'c', name: 'C', description: '', prompt: 'p', builtin: false, updatedAt: '' }]), true)
+  assert.equal(hasDirtyScenes(base, [...base, { id: 'c', name: 'C', description: '', prompt: 'p', operationManual: '', builtin: false, updatedAt: '' }]), true)
   assert.equal(hasDirtyScenes(base, [base[0]]), true)
   // 空列表对空列表 → 不脏
   assert.equal(hasDirtyScenes([], []), false)
@@ -63,8 +86,8 @@ test('hasDirtyScenes 管理弹窗脏检查（关闭丢弃守卫用）', () => {
 
 test('applyDraftEdit / applyDraftRemove 管理弹窗草稿写回（单步保存）', () => {
   const base = [
-    { id: 'a', name: 'A', description: 'd1', prompt: 'p1', builtin: true, updatedAt: 't1' },
-    { id: 'b', name: 'B', description: 'd2', prompt: 'p2', builtin: false, updatedAt: 't2' },
+    { id: 'a', name: 'A', description: 'd1', prompt: 'p1', operationManual: '', builtin: true, updatedAt: 't1' },
+    { id: 'b', name: 'B', description: 'd2', prompt: 'p2', operationManual: '', builtin: false, updatedAt: 't2' },
   ]
   // 编辑：按 id 替换，其余不动
   const edited = applyDraftEdit(base, 'a', { ...base[0], name: 'A2', prompt: 'p1-改' })
@@ -74,7 +97,7 @@ test('applyDraftEdit / applyDraftRemove 管理弹窗草稿写回（单步保存�
   assert.equal(edited[0].prompt, 'p1-改')
   assert.equal(edited[1].id, 'b')
   // 新增（sel='new'）：追加
-  const added = applyDraftEdit(base, 'new', { id: 'c', name: 'C', description: '', prompt: 'p3', builtin: false, updatedAt: '' })
+  const added = applyDraftEdit(base, 'new', { id: 'c', name: 'C', description: '', prompt: 'p3', operationManual: '', builtin: false, updatedAt: '' })
   assert.equal(added.length, 3)
   assert.equal(added[2].id, 'c')
   // 不可变：原数组不被修改

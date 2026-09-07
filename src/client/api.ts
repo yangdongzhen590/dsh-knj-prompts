@@ -22,6 +22,17 @@ export async function saveScenes(scenes: Scene[]): Promise<Scene[]> {
   return data.scenes ?? []
 }
 
+export async function uploadScenePackage(file: File): Promise<{ path: string }> {
+  const res = await fetch(`${BASE}/imports`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/zip', 'x-file-name': encodeURIComponent(file.name) },
+    body: file,
+  })
+  const data = await res.json() as { path?: string; error?: string }
+  if (!res.ok || data.error || !data.path) throw new Error(data.error ?? `upload failed: ${res.status}`)
+  return { path: data.path }
+}
+
 export async function fetchVars(): Promise<PromptVar[]> {
   const res = await fetch(`${BASE}/vars`, { cache: 'no-store' })
   if (!res.ok) throw new Error(`prompts api ${res.status}`)

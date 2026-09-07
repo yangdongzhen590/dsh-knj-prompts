@@ -30,11 +30,13 @@ export function validateScene(raw: unknown): Scene | null {
   if (typeof s.id !== 'string' || !SAFE_ID.test(s.id)) return null
   if (typeof s.name !== 'string' || !s.name.trim()) return null
   if (typeof s.prompt !== 'string' || !s.prompt.trim()) return null
+  if ('operationManual' in s && typeof s.operationManual !== 'string') return null
   return {
     id: s.id,
     name: s.name,
     description: typeof s.description === 'string' ? s.description : '',
     prompt: s.prompt,
+    operationManual: typeof s.operationManual === 'string' ? s.operationManual : '',
     builtin: s.builtin === true,
     updatedAt: typeof s.updatedAt === 'string' ? s.updatedAt : '',
     ...(typeof s.seedPrompt === 'string' ? { seedPrompt: s.seedPrompt } : {}),
@@ -48,6 +50,21 @@ export function sanitizeId(name: string): string {
     .replace(/[^a-zA-Z0-9\u4e00-\u9fff-]+/g, '-')
     .replace(/^-+|-+$/g, '')
   return cleaned || 'scene-' + Date.now().toString(36)
+}
+
+/**
+ * 为 exporter 组装已选场景的明确草稿。场景数据以内嵌 JSON 交给 skill，避免 AI 再反问选择目标。
+ * 只携带场景包所需字段，不带 builtin、时间戳或源环境运行配置。
+ */
+export function buildScenePackageExportDraft(exporterPrompt: string, scene: Scene): string {
+  const selectedScene = JSON.stringify({
+    id: scene.id,
+    name: scene.name,
+    description: scene.description,
+    prompt: scene.prompt,
+    operationManual: scene.operationManual,
+  })
+  return `${exporterPrompt.replace('先询问我要导出的场景；', '')}\n\n已在插件中选择要导出的普通场景。不要再询问选择目标；直接以以下 JSON 作为 scene.json 的来源，并按其中 operationManual 制定预览计划：\n\n\`\`\`json\n${selectedScene}\n\`\`\``
 }
 
 /** 场景应用决策：当前会话是否空白 × 是否有新建会话通道（workspaces）。 */
@@ -80,7 +97,7 @@ export function uniqueId(name: string, existingIds: readonly string[]): string {
 export function hasDirtyScenes(original: readonly Scene[], drafts: readonly Scene[]): boolean {
   if (original.length !== drafts.length) return true
   const key = (s: Scene): string =>
-    JSON.stringify([s.id, s.name, s.description, s.prompt, s.builtin])
+    JSON.stringify([s.id, s.name, s.description, s.prompt, s.operationManual, s.builtin])
   const baseline = new Set(original.map(key))
   return drafts.some((d) => !baseline.has(key(d)))
 }
@@ -155,6 +172,32 @@ export function filterVars(vars: readonly PromptVar[], query: string): PromptVar
   if (!q) return [...vars]
   return vars.filter((v) =>
     matchesFuzzy(v.name, q) || matchesFuzzy(v.value, q))
+}
+
+/** 场景编辑表单（管理弹窗固定底部操作栏的受控输入）。 */
+export interface SceneForm { name: string; description: string; prompt: string; operationManual: string }
+
+/**
+ * 把编辑表单合并进场景草稿：编辑保留原 id；新增（base.id 为空）用名称净化
+ * 生成不冲突 id（uniqueId）。供管理弹窗固定底部操作栏的「保存修改」使用。
+ */
+export function buildSceneEdit(base: Scene, form: SceneForm, existingIds: readonly string[]): Scene {
+  return {
+    ...base,
+    id: base.id || uniqueId(form.name, existingIds),
+    name: form.name,
+    description: form.description,
+    prompt: form.prompt,
+    operationManual: form.operationManual,
+  }
+}
+
+/** 变量编辑表单（管理弹窗固定底部操作栏的受控输入）。 */
+export interface VarForm { name: string; value: string }
+
+/** 把变量编辑表单合并进变量条目（name/value 去空白）。 */
+export function buildVarEdit(base: PromptVar, form: VarForm): PromptVar {
+  return { ...base, name: form.name.trim(), value: form.value.trim() }
 }
 
 /** 挂起填充有效期：超过后丢弃（startSession 失败时不误填之后手动新建的会话）。 */

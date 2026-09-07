@@ -23,7 +23,9 @@ export class SceneStore {
     try {
       const raw = JSON.parse(readFileSync(this.file, 'utf8')) as { version?: number; scenes?: Scene[] }
       this.scenes = Array.isArray(raw.scenes)
-        ? raw.scenes.filter((s) => s && typeof s === 'object' && SAFE_ID.test(s.id) && typeof s.prompt === 'string')
+        ? raw.scenes
+          .filter((s) => s && typeof s === 'object' && SAFE_ID.test(s.id) && typeof s.prompt === 'string')
+          .map((s) => ({ ...s, operationManual: typeof s.operationManual === 'string' ? s.operationManual : '' }))
         : []
     } catch {
       try { renameSync(this.file, this.file + '.bak') } catch { /* 备份失败不阻断 */ }
@@ -79,6 +81,7 @@ export class SceneStore {
         || prev.name !== s.name
         || prev.description !== s.description
         || prev.prompt !== s.prompt
+        || prev.operationManual !== s.operationManual
         || prev.builtin !== s.builtin
       return { ...s, updatedAt: contentChanged ? now : (s.updatedAt || now) }
     })

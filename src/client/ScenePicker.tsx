@@ -7,10 +7,13 @@
  * 宿主 API 结论见 PROBE.md。
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { fetchScenes, fetchVars, saveScenes, saveVars } from './api.ts'
+import { fetchScenes, fetchVars, saveScenes, saveVars, uploadScenePackage } from './api.ts'
 import {
+  buildScenePackageExportDraft,
   applyDraftEdit,
   applyDraftRemove,
+  buildSceneEdit,
+  buildVarEdit,
   extractVariables,
   fillPrompt,
   filterScenes,
@@ -21,10 +24,10 @@ import {
   isPendingFillEligible,
   PENDING_TTL_MS,
   resolveSceneAction,
-  uniqueId,
   validateScene,
   validateVar,
 } from './engine.ts'
+import type { SceneForm, VarForm } from './engine.ts'
 import { IconChevronDown, IconClose, IconPlus, IconSparkles, IconTrash } from './icons.tsx'
 import type { PromptVar, Scene } from '../types.ts'
 
@@ -32,12 +35,12 @@ import type { PromptVar, Scene } from '../types.ts'
 interface PendingFill { text: string; at: number; fromSessionId?: string }
 let pendingFill: PendingFill | undefined
 
+type PickerMode = 'menu' | 'fill' | 'export-select'
+
 /** 宿主注入本组件的最小结构面（标准套件 + InputZone owner share）。 */
 export interface ScenePickerProps {
-  /** 标准套件：当前会话 id（挂起填充的会话差量守卫用）。 */
-  sessionId?: string
-  /** InputZone owner share：会话快照（blank=空日志）。 */
-  session?: { blank?: boolean }
+  /** InputZone owner share：会话快照（sessionId + blank=空日志）。 */
+  session?: { sessionId?: string; blank?: boolean }
   /** 标准套件：inputActions.setDraft 是唯一公开草稿写通道。 */
   inputActions?: { setDraft(text: string): void }
   /**
@@ -49,19 +52,26 @@ export interface ScenePickerProps {
 
 /** 应用填充：决策见 engine.resolveSceneAction（空白→原地填；非空白→挂起并切新会话；无通道→兜底填当前）。 */
 function applySceneText(props: ScenePickerProps, text: string): void {
+  const sessionBlank = props.session?.blank
+  // 当前 DSH 运行时的 input.right 只提供标准 inputActions，未注入 InputZone owner share。
+  // 缺少会话身份/空白态时不能安全挂起跨会话填充，保守地直接写当前草稿。
+  if (sessionBlank === undefined) {
+    props.inputActions?.setDraft(text)
+    return
+  }
   const workspaces = props.workspaces?.()
-  const action = resolveSceneAction(props.session?.blank === true, workspaces !== undefined)
+  const action = resolveSceneAction(sessionBlank, workspaces !== undefined)
   if (action === 'fill-here') {
     props.inputActions?.setDraft(text)
     return
   }
-  pendingFill = { text, at: Date.now(), fromSessionId: props.sessionId }
+  pendingFill = { text, at: Date.now(), fromSessionId: props.session?.sessionId }
   workspaces!.startSession()
 }
 
 export function ScenePicker(props: ScenePickerProps) {
   const [open, setOpen] = useState(false)
-  const [mode, setMode] = useState<'menu' | 'fill'>('menu')
+  const [mode, setMode] = useState<PickerMode>('menu')
   const [manage, setManage] = useState(false)
   const [scenes, setScenes] = useState<Scene[] | null>(null) // null = 加载中
   const [vars, setVars] = useState<PromptVar[] | null>(null) // 变量库（填充面板下拉候选；null = 未加载/加载失败）
@@ -69,9 +79,12 @@ export function ScenePicker(props: ScenePickerProps) {
   const [menuQuery, setMenuQuery] = useState('') // 下拉菜单场景搜索词（重开菜单时重置）
   const [fillScene, setFillScene] = useState<Scene | null>(null)
   const [fillValues, setFillValues] = useState<Record<string, string>>({})
+  const [uploadingPackage, setUploadingPackage] = useState(false)
+  const [packageError, setPackageError] = useState<string | null>(null)
   const [pos, setPos] = useState<{ right: number; bottom: number } | null>(null)
   const btnRef = useRef<HTMLButtonElement>(null)
   const popRef = useRef<HTMLDivElement>(null)
+  const packageInputRef = useRef<HTMLInputElement>(null)
 
   // 消费挂起填充：新空白会话挂载/重渲染时落地（TTL 内 + 会话差量守卫；幂等）
   useEffect(() => {
@@ -81,7 +94,7 @@ export function ScenePicker(props: ScenePickerProps) {
         props.session?.blank === true,
         Date.now() - pendingFill.at,
         pendingFill.fromSessionId,
-        props.sessionId,
+        props.session?.sessionId,
       ) &&
       props.inputActions
     ) {
@@ -145,7 +158,36 @@ export function ScenePicker(props: ScenePickerProps) {
     }
   }, [open])
 
+  const installScenePackage = async (file: File) => {
+    setPackageError(null)
+    if (!/\.zip$/i.test(file.name)) {
+      setPackageError('请选择 .zip 场景包')
+      return
+    }
+    setUploadingPackage(true)
+    try {
+      const { path } = await uploadScenePackage(file)
+      const installer = scenes?.find((scene) => scene.id === 'install-scene-package')
+      if (!installer) throw new Error('未找到“安装场景包”内置场景')
+      applySceneText(props, fillPrompt(installer.prompt, { 场景包ZIP路径: path }))
+      setOpen(false)
+    } catch (error) {
+      setPackageError(error instanceof Error ? `上传失败：${error.message}` : '上传失败，请重试')
+    } finally {
+      setUploadingPackage(false)
+    }
+  }
+
   const pick = (s: Scene) => {
+    if (s.id === 'export-scene-package') {
+      setMenuQuery('')
+      setMode('export-select')
+      return
+    }
+    if (s.id === 'install-scene-package') {
+      packageInputRef.current?.click()
+      return
+    }
     const vars = extractVariables(s.prompt)
     if (vars.length === 0) {
       applySceneText(props, s.prompt)
@@ -163,10 +205,29 @@ export function ScenePicker(props: ScenePickerProps) {
     setOpen(false)
   }
 
+  const exportScene = (scene: Scene) => {
+    const exporter = scenes?.find((candidate) => candidate.id === 'export-scene-package')
+    if (!exporter) return
+    applySceneText(props, buildScenePackageExportDraft(exporter.prompt, scene))
+    setOpen(false)
+  }
+
   const inBlank = props.session?.blank === true
 
   return (
     <div className="knj-p p-anchor">
+      <input
+        ref={packageInputRef}
+        className="p-file-input"
+        type="file"
+        accept=".zip,application/zip"
+        aria-label="选择场景包 ZIP"
+        onChange={(event) => {
+          const file = event.currentTarget.files?.[0]
+          event.currentTarget.value = ''
+          if (file) void installScenePackage(file)
+        }}
+      />
       <button
         ref={btnRef}
         type="button"
@@ -187,10 +248,13 @@ export function ScenePicker(props: ScenePickerProps) {
           style={{ position: 'fixed', right: `${pos.right}px`, bottom: `${pos.bottom}px` }}
         >
           {mode === 'menu'
-            ? renderMenu(scenes, loadErr, menuQuery, setMenuQuery, () => void load(), pick, () => setManage(true))
+            ? <>{packageError ? <div className="p-banner p-banner--err">{packageError}</div> : null}{renderMenu(scenes, loadErr, menuQuery, setMenuQuery, () => void load(), pick, () => setManage(true), uploadingPackage)}</>
             : null}
           {mode === 'fill' && fillScene
             ? renderFill(fillScene, fillValues, setFillValues, inBlank, () => setMode('menu'), confirmFill, vars)
+            : null}
+          {mode === 'export-select'
+            ? renderExportSelection(scenes, menuQuery, setMenuQuery, exportScene)
             : null}
         </div>
       )}
@@ -208,6 +272,39 @@ export function ScenePicker(props: ScenePickerProps) {
   )
 }
 
+/** 导出选择面板：只允许选用户创建的普通场景，单击即生成 exporter 草稿。 */
+function renderExportSelection(
+  scenes: Scene[] | null,
+  query: string,
+  setQuery: (q: string) => void,
+  exportScene: (scene: Scene) => void,
+) {
+  if (!scenes) return <div className="p-empty">加载场景中…</div>
+  const ordinary = scenes.filter((scene) => !scene.builtin)
+  const filtered = filterScenes(ordinary, query)
+  return (
+    <>
+      <div className="p-menu-title">选择要导出的场景</div>
+      <div className="p-menu-hint">单击一个普通场景后，会将它的说明直接交给导出助手。</div>
+      <input
+        className="p-input p-search"
+        value={query}
+        placeholder="搜索普通场景"
+        spellCheck={false}
+        autoFocus
+        onChange={(e) => setQuery(e.target.value)}
+      />
+      {filtered.map((scene) => (
+        <button key={scene.id} type="button" className="p-menu-item" onClick={() => exportScene(scene)}>
+          <span className="p-menu-item__name">{scene.name}</span>
+          {scene.description ? <span className="p-menu-item__desc">{scene.description}</span> : null}
+        </button>
+      ))}
+      {filtered.length === 0 ? <div className="p-empty">没有可导出的普通场景</div> : null}
+    </>
+  )
+}
+
 /** 下拉主面板：场景搜索 + 列表 + 管理入口。 */
 function renderMenu(
   scenes: Scene[] | null,
@@ -217,6 +314,7 @@ function renderMenu(
   retry: () => void,
   pick: (s: Scene) => void,
   openManage: () => void,
+  uploadingPackage: boolean,
 ) {
   if (loadErr) {
     return (
@@ -255,7 +353,7 @@ function renderMenu(
       {filtered.map((s) => {
         const vars = extractVariables(s.prompt)
         return (
-          <button key={s.id} type="button" className="p-menu-item" onClick={() => pick(s)}>
+          <button key={s.id} type="button" className="p-menu-item" disabled={uploadingPackage} onClick={() => pick(s)}>
             <span className="p-menu-item__name">
               {s.name}
               {s.builtin ? <span className="p-tag">内置</span> : null}
@@ -403,12 +501,15 @@ function VarValueInput({ value, vars, onChange }: {
 
 /** 新场景草稿（id 由保存时 uniqueId 生成）。 */
 function newDraft(): Scene {
-  return { id: '', name: '', description: '', prompt: '', builtin: false, updatedAt: '' }
+  return { id: '', name: '', description: '', prompt: '', operationManual: '', builtin: false, updatedAt: '' }
 }
 
 /** 管理弹窗：场景 / 变量库 两个页签。两者均为单步保存（保存修改/删除 = 立即 PUT 落盘）。
- *  保存失败时草稿保留 + 错误横幅 + 底部「重试保存」；关闭时若任一页有未落盘修改先确认。 */
-function ManageModal({ scenes, vars, onClose, onSaved, onVarsSaved }: {
+ *  布局为三段式：固定头部（标题/关闭/Tab）+ 独立滚动内容区 + 固定底部操作栏；
+ *  场景/变量很多或表单较长时，操作按钮不随内容滚走（「重试保存」始终可见）。
+ *  保存失败时草稿保留 + 错误横幅 + 底部「重试保存」；关闭时若任一页有未落盘修改先确认。
+ *  （导出仅为 .verify/ 组件级验证入口使用，非插件公开 API。） */
+export function ManageModal({ scenes, vars, onClose, onSaved, onVarsSaved }: {
   scenes: Scene[]
   vars: PromptVar[]
   onClose: () => void
@@ -422,11 +523,23 @@ function ManageModal({ scenes, vars, onClose, onSaved, onVarsSaved }: {
   const [banner, setBanner] = useState<{ ok: boolean; text: string } | null>(null)
   const [saving, setSaving] = useState(false)
   const [sceneQuery, setSceneQuery] = useState('') // 场景列表搜索词
+  // 编辑表单（受控；保存/取消入口在固定底部操作栏）。进入编辑器时由 sel 同步一次。
+  const [editForm, setEditForm] = useState<SceneForm | null>(null)
 
   const dirty = hasDirtyScenes(scenes, drafts)
 
   const editing: Scene | null =
     sel === null ? null : sel === 'new' ? newDraft() : (drafts.find((d) => d.id === sel) ?? null)
+
+  // 进入/切换编辑对象时同步表单（编辑器本身不持有本地状态）
+  useEffect(() => {
+    if (sel === null) {
+      setEditForm(null)
+      return
+    }
+    const base = sel === 'new' ? newDraft() : (drafts.find((d) => d.id === sel) ?? null)
+    if (base) setEditForm({ name: base.name, description: base.description, prompt: base.prompt, operationManual: base.operationManual })
+  }, [sel])
 
   /** 单步落盘：校验 → PUT → 反馈。target 由调用方显式传入（setDrafts 异步，闭包里的 drafts 可能陈旧）。 */
   const persist = async (target: Scene[], okText = '已保存') => {
@@ -457,6 +570,14 @@ function ManageModal({ scenes, vars, onClose, onSaved, onVarsSaved }: {
     setDrafts(nextDrafts)
     setSel(null)
     void persist(nextDrafts)
+  }
+
+  /** 固定底部操作栏的「保存修改」：用受控表单构建场景（新增时由名称生成不冲突 id）。 */
+  const submitEdit = () => {
+    if (sel === null || saving || !editForm) return
+    const base = sel === 'new' ? newDraft() : (drafts.find((d) => d.id === sel) ?? null)
+    if (!base) return
+    saveEdit(buildSceneEdit(base, editForm, drafts.map((d) => d.id)))
   }
 
   /** 删除：确认后移除并立即落盘（单步）。 */
@@ -510,69 +631,90 @@ function ManageModal({ scenes, vars, onClose, onSaved, onVarsSaved }: {
 
         {tab === 'scenes' ? (
           <>
-            {banner ? (
-              <div className={banner.ok ? 'p-banner p-banner--ok' : 'p-banner p-banner--err'}>{banner.text}</div>
-            ) : null}
+            <div className="p-modal-body">
+              {banner ? (
+                <div className={banner.ok ? 'p-banner p-banner--ok' : 'p-banner p-banner--err'}>{banner.text}</div>
+              ) : null}
 
-            {editing ? (
-              <SceneEditor
-                scene={editing}
-                existingIds={drafts.map((d) => d.id)}
-                onCancel={() => setSel(null)}
-                onSave={saveEdit}
-              />
-            ) : (
-              <>
-                {drafts.length > 0 ? (
-                  <input
-                    className="p-input p-search"
-                    value={sceneQuery}
-                    placeholder="搜索场景（名称/描述/提示词）"
-                    spellCheck={false}
-                    onChange={(e) => setSceneQuery(e.target.value)}
-                  />
-                ) : null}
-                <div className="p-manage-list">
-                  {filterScenes(drafts, sceneQuery).map((d) => {
-                    const varsInPrompt = extractVariables(d.prompt)
-                    return (
-                      <div key={d.id} className="p-manage-row">
-                        <div className="p-manage-main">
-                          <span className="p-manage-name">
-                            {d.name || <em className="p-empty-inline">（未命名）</em>}
-                            {d.builtin ? <span className="p-tag">内置</span> : null}
-                          </span>
-                          {d.description ? <span className="p-manage-desc">{d.description}</span> : null}
-                          {varsInPrompt.length > 0 ? (
-                            <span className="p-vars">
-                              {varsInPrompt.map((v) => (
-                                <code key={v} className="p-var">{`{${v}}`}</code>
-                              ))}
-                            </span>
-                          ) : null}
-                        </div>
-                        <div className="p-manage-actions">
-                          <button type="button" className="p-btn p-btn--sm" onClick={() => setSel(d.id)}>编辑</button>
-                          {d.builtin ? null : (
-                            <button
-                              type="button"
-                              className="p-btn p-btn--sm p-btn--danger"
-                              title="删除场景"
-                              onClick={() => remove(d.id)}
-                            >
-                              <IconTrash size={13} />
-                            </button>
-                          )}
-                        </div>
-                      </div>
-                    )
-                  })}
-                  {drafts.length === 0 ? <div className="p-empty">还没有场景</div> : null}
-                  {drafts.length > 0 && filterScenes(drafts, sceneQuery).length === 0 ? (
-                    <div className="p-empty">没有匹配的场景</div>
+              {editing ? (
+                <SceneEditor form={editForm} onChange={setEditForm} />
+              ) : (
+                <>
+                  {drafts.length > 0 ? (
+                    <input
+                      className="p-input p-search"
+                      value={sceneQuery}
+                      placeholder="搜索场景（名称/描述/提示词）"
+                      spellCheck={false}
+                      onChange={(e) => setSceneQuery(e.target.value)}
+                    />
                   ) : null}
-                </div>
-                <div className="p-row" style={{ justifyContent: 'space-between' }}>
+                  <div className="p-manage-list">
+                    {filterScenes(drafts, sceneQuery).map((d) => {
+                      const varsInPrompt = extractVariables(d.prompt)
+                      return (
+                        <div key={d.id} className="p-manage-row">
+                          <div className="p-manage-main">
+                            <span className="p-manage-name">
+                              {d.name || <em className="p-empty-inline">（未命名）</em>}
+                              {d.builtin ? <span className="p-tag">内置</span> : null}
+                            </span>
+                            {d.description ? <span className="p-manage-desc">{d.description}</span> : null}
+                            {varsInPrompt.length > 0 ? (
+                              <span className="p-vars">
+                                {varsInPrompt.map((v) => (
+                                  <code key={v} className="p-var">{`{${v}}`}</code>
+                                ))}
+                              </span>
+                            ) : null}
+                          </div>
+                          <div className="p-manage-actions">
+                            <button type="button" className="p-btn p-btn--sm" onClick={() => setSel(d.id)}>编辑</button>
+                            {d.builtin ? null : (
+                              <button
+                                type="button"
+                                className="p-btn p-btn--sm p-btn--danger"
+                                title="删除场景"
+                                onClick={() => remove(d.id)}
+                              >
+                                <IconTrash size={13} />
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      )
+                    })}
+                    {drafts.length === 0 ? <div className="p-empty">还没有场景</div> : null}
+                    {drafts.length > 0 && filterScenes(drafts, sceneQuery).length === 0 ? (
+                      <div className="p-empty">没有匹配的场景</div>
+                    ) : null}
+                  </div>
+                  <div className="p-hint">
+                    保存修改 / 删除会立即写入磁盘；删除前需确认。保存失败时草稿保留，可点「重试保存」。
+                    内置场景可编辑（以你的修改为准），不可删除；删除后重新载入插件会恢复 seed。
+                    在「变量库」页签可配置可复用的 {'{变量}'} 候选值。
+                  </div>
+                </>
+              )}
+            </div>
+            <div className="p-modal-foot">
+              {editing ? (
+                <>
+                  <span />
+                  <div className="p-row">
+                    <button type="button" className="p-btn p-btn--sm" onClick={() => setSel(null)}>取消</button>
+                    <button
+                      type="button"
+                      className="p-btn p-btn--sm p-btn--primary"
+                      disabled={saving || !editForm?.name.trim() || !editForm?.prompt.trim()}
+                      onClick={submitEdit}
+                    >
+                      保存修改
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <>
                   <button type="button" className="p-btn p-btn--sm" onClick={() => setSel('new')}>
                     <IconPlus size={12} />
                     <span>新增场景</span>
@@ -590,14 +732,9 @@ function ManageModal({ scenes, vars, onClose, onSaved, onVarsSaved }: {
                       </button>
                     ) : null}
                   </div>
-                </div>
-                <div className="p-hint">
-                  保存修改 / 删除会立即写入磁盘；删除前需确认。保存失败时草稿保留，可点「重试保存」。
-                  内置场景可编辑（以你的修改为准），不可删除；删除后重新载入插件会恢复 seed。
-                  在「变量库」页签可配置可复用的 {'{变量}'} 候选值。
-                </div>
-              </>
-            )}
+                </>
+              )}
+            </div>
           </>
         ) : (
           <VarManager
@@ -612,7 +749,8 @@ function ManageModal({ scenes, vars, onClose, onSaved, onVarsSaved }: {
   )
 }
 
-/** 变量库管理：新增 / 编辑 / 删除，单步保存（与场景页同模式）。全局共享、名称大小写不敏感唯一。 */
+/** 变量库管理：新增 / 编辑 / 删除，单步保存（与场景页同模式）。全局共享、名称大小写不敏感唯一。
+ *  三段式布局：内容区（p-modal-body）独立滚动，操作栏（p-modal-foot）固定。 */
 function VarManager({ vars, onSaved, onClose, onDirtyChange }: {
   vars: PromptVar[]
   onSaved: (next: PromptVar[]) => void
@@ -624,6 +762,8 @@ function VarManager({ vars, onSaved, onClose, onDirtyChange }: {
   const [banner, setBanner] = useState<{ ok: boolean; text: string } | null>(null)
   const [saving, setSaving] = useState(false)
   const [varQuery, setVarQuery] = useState('') // 变量列表搜索词
+  // 编辑表单（受控；保存/取消入口在固定底部操作栏）。进入编辑器时由 sel 同步一次。
+  const [editForm, setEditForm] = useState<VarForm | null>(null)
 
   const dirty = hasDirtyVars(vars, drafts)
   useEffect(() => { onDirtyChange(dirty) }, [dirty, onDirtyChange])
@@ -634,6 +774,18 @@ function VarManager({ vars, onSaved, onClose, onDirtyChange }: {
       : sel === 'new'
         ? { name: '', value: '', updatedAt: '' }
         : (drafts.find((d) => d.name.toLowerCase() === sel.toLowerCase()) ?? null)
+
+  // 进入/切换编辑对象时同步表单（编辑器本身不持有本地状态）
+  useEffect(() => {
+    if (sel === null) {
+      setEditForm(null)
+      return
+    }
+    const base = sel === 'new'
+      ? { name: '', value: '', updatedAt: '' }
+      : (drafts.find((d) => d.name.toLowerCase() === sel.toLowerCase()) ?? null)
+    if (base) setEditForm({ name: base.name, value: base.value })
+  }, [sel])
 
   /** 单步落盘：校验 → PUT → 反馈（与场景页同款）。 */
   const persist = async (target: PromptVar[], okText = '已保存') => {
@@ -671,6 +823,16 @@ function VarManager({ vars, onSaved, onClose, onDirtyChange }: {
     void persist(nextDrafts)
   }
 
+  /** 固定底部操作栏的「保存修改」：用受控表单构建变量条目（去空白）。 */
+  const submitEdit = () => {
+    if (sel === null || saving || !editForm) return
+    const base = sel === 'new'
+      ? { name: '', value: '', updatedAt: '' }
+      : (drafts.find((d) => d.name.toLowerCase() === sel.toLowerCase()) ?? null)
+    if (!base) return
+    saveEdit(buildVarEdit(base, editForm))
+  }
+
   const remove = (name: string) => {
     if (!window.confirm(`确定删除变量「${name}」吗？删除后立即生效，不可撤销。`)) return
     const nextDrafts = drafts.filter((d) => d.name.toLowerCase() !== name.toLowerCase())
@@ -681,51 +843,75 @@ function VarManager({ vars, onSaved, onClose, onDirtyChange }: {
 
   return (
     <>
-      {banner ? (
-        <div className={banner.ok ? 'p-banner p-banner--ok' : 'p-banner p-banner--err'}>{banner.text}</div>
-      ) : null}
+      <div className="p-modal-body">
+        {banner ? (
+          <div className={banner.ok ? 'p-banner p-banner--ok' : 'p-banner p-banner--err'}>{banner.text}</div>
+        ) : null}
 
-      {editing ? (
-        <VarEditor v={editing} onCancel={() => setSel(null)} onSave={saveEdit} />
-      ) : (
-        <>
-          {drafts.length > 0 ? (
-            <input
-              className="p-input p-search"
-              value={varQuery}
-              placeholder="搜索变量（名称/值）"
-              spellCheck={false}
-              onChange={(e) => setVarQuery(e.target.value)}
-            />
-          ) : null}
-          <div className="p-manage-list">
-            {filterVars(drafts, varQuery).map((v) => (
-              <div key={v.name} className="p-manage-row">
-                <div className="p-manage-main">
-                  <span className="p-manage-name">{v.name}</span>
-                  {v.value ? (
-                    <span className="p-manage-desc">= {v.value}</span>
-                  ) : null}
-                </div>
-                <div className="p-manage-actions">
-                  <button type="button" className="p-btn p-btn--sm" onClick={() => setSel(v.name)}>编辑</button>
-                  <button
-                    type="button"
-                    className="p-btn p-btn--sm p-btn--danger"
-                    title="删除变量"
-                    onClick={() => remove(v.name)}
-                  >
-                    <IconTrash size={13} />
-                  </button>
-                </div>
-              </div>
-            ))}
-            {drafts.length === 0 ? <div className="p-empty">还没有变量，先添加一个</div> : null}
-            {drafts.length > 0 && filterVars(drafts, varQuery).length === 0 ? (
-              <div className="p-empty">没有匹配的变量</div>
+        {editing ? (
+          <VarEditor form={editForm} onChange={setEditForm} />
+        ) : (
+          <>
+            {drafts.length > 0 ? (
+              <input
+                className="p-input p-search"
+                value={varQuery}
+                placeholder="搜索变量（名称/值）"
+                spellCheck={false}
+                onChange={(e) => setVarQuery(e.target.value)}
+              />
             ) : null}
-          </div>
-          <div className="p-row" style={{ justifyContent: 'space-between' }}>
+            <div className="p-manage-list">
+              {filterVars(drafts, varQuery).map((v) => (
+                <div key={v.name} className="p-manage-row">
+                  <div className="p-manage-main">
+                    <span className="p-manage-name">{v.name}</span>
+                    {v.value ? (
+                      <span className="p-manage-desc">= {v.value}</span>
+                    ) : null}
+                  </div>
+                  <div className="p-manage-actions">
+                    <button type="button" className="p-btn p-btn--sm" onClick={() => setSel(v.name)}>编辑</button>
+                    <button
+                      type="button"
+                      className="p-btn p-btn--sm p-btn--danger"
+                      title="删除变量"
+                      onClick={() => remove(v.name)}
+                    >
+                      <IconTrash size={13} />
+                    </button>
+                  </div>
+                </div>
+              ))}
+              {drafts.length === 0 ? <div className="p-empty">还没有变量，先添加一个</div> : null}
+              {drafts.length > 0 && filterVars(drafts, varQuery).length === 0 ? (
+                <div className="p-empty">没有匹配的变量</div>
+              ) : null}
+            </div>
+            <div className="p-hint">
+              变量全局共享：任意场景的填充面板里，每个 {'{变量}'} 下拉列出全部已配置变量（名称 = 值），选中即用该变量的值填入；也可手动输入。变量名不区分大小写且不可重复；删除前会确认。
+            </div>
+          </>
+        )}
+      </div>
+      <div className="p-modal-foot">
+        {editing ? (
+          <>
+            <span />
+            <div className="p-row">
+              <button type="button" className="p-btn p-btn--sm" onClick={() => setSel(null)}>取消</button>
+              <button
+                type="button"
+                className="p-btn p-btn--sm p-btn--primary"
+                disabled={saving || !editForm?.name.trim() || !editForm?.value.trim()}
+                onClick={submitEdit}
+              >
+                保存修改
+              </button>
+            </div>
+          </>
+        ) : (
+          <>
             <button type="button" className="p-btn p-btn--sm" onClick={() => setSel('new')}>
               <IconPlus size={12} />
               <span>新增变量</span>
@@ -743,100 +929,82 @@ function VarManager({ vars, onSaved, onClose, onDirtyChange }: {
                 </button>
               ) : null}
             </div>
-          </div>
-          <div className="p-hint">
-            变量全局共享：任意场景的填充面板里，每个 {'{变量}'} 下拉列出全部已配置变量（名称 = 值），选中即用该变量的值填入；也可手动输入。变量名不区分大小写且不可重复；删除前会确认。
-          </div>
-        </>
-      )}
-    </>
-  )
-}
-
-/** 单变量编辑表单（新增/编辑共用；「保存修改」由 VarManager 单步落盘）。 */
-function VarEditor({ v, onCancel, onSave }: {
-  v: PromptVar
-  onCancel: () => void
-  onSave: (next: PromptVar) => void
-}) {
-  const [name, setName] = useState(v.name)
-  const [value, setValue] = useState(v.value)
-
-  const submit = () => onSave({ name: name.trim(), value: value.trim(), updatedAt: v.updatedAt })
-
-  return (
-    <>
-      <label className="p-form-row">
-        <span className="p-form-label">变量名 *（如 项目 / 范围，不区分大小写）</span>
-        <input className="p-input" value={name} spellCheck={false} onChange={(e) => setName(e.target.value)} />
-      </label>
-      <label className="p-form-row">
-        <span className="p-form-label">值 *（填充时点选此变量即插入该值）</span>
-        <input
-          className="p-input"
-          value={value}
-          placeholder="如 iobs_pro / 多租户缓存服务"
-          spellCheck={false}
-          onChange={(e) => setValue(e.target.value)}
-        />
-      </label>
-      <div className="p-hint">改一处全局生效：所有场景填充时都能选到这个变量。</div>
-      <div className="p-row" style={{ justifyContent: 'flex-end' }}>
-        <button type="button" className="p-btn p-btn--sm" onClick={onCancel}>取消</button>
-        <button
-          type="button"
-          className="p-btn p-btn--sm p-btn--primary"
-          disabled={!name.trim() || !value.trim()}
-          onClick={submit}
-        >
-          保存修改
-        </button>
+          </>
+        )}
       </div>
     </>
   )
 }
 
-/** 单场景编辑表单（新增/编辑共用；「保存修改」由 ManageModal 单步落盘）。 */
-function SceneEditor({ scene, existingIds, onCancel, onSave }: {
-  scene: Scene
-  existingIds: string[]
-  onCancel: () => void
-  onSave: (next: Scene) => void
+/** 单变量编辑表单（受控；「保存修改/取消」在管理弹窗固定底部操作栏）。 */
+function VarEditor({ form, onChange }: {
+  form: VarForm | null
+  onChange: (next: VarForm) => void
 }) {
-  const [name, setName] = useState(scene.name)
-  const [description, setDescription] = useState(scene.description)
-  const [prompt, setPrompt] = useState(scene.prompt)
-  const vars = extractVariables(prompt)
+  if (!form) return null
+  return (
+    <>
+      <label className="p-form-row">
+        <span className="p-form-label">变量名 *（如 项目 / 范围，不区分大小写）</span>
+        <input className="p-input" value={form.name} spellCheck={false} onChange={(e) => onChange({ ...form, name: e.target.value })} />
+      </label>
+      <label className="p-form-row">
+        <span className="p-form-label">值 *（填充时点选此变量即插入该值）</span>
+        <input
+          className="p-input"
+          value={form.value}
+          placeholder="如 iobs_pro / 多租户缓存服务"
+          spellCheck={false}
+          onChange={(e) => onChange({ ...form, value: e.target.value })}
+        />
+      </label>
+      <div className="p-hint">改一处全局生效：所有场景填充时都能选到这个变量。</div>
+    </>
+  )
+}
 
-  const submit = () => {
-    const id = scene.id || uniqueId(name, existingIds)
-    onSave({ ...scene, id, name, description, prompt })
-  }
-
+/** 单场景编辑表单（受控；「保存修改/取消」在管理弹窗固定底部操作栏）。 */
+function SceneEditor({ form, onChange }: {
+  form: SceneForm | null
+  onChange: (next: SceneForm) => void
+}) {
+  if (!form) return null
+  const vars = extractVariables(form.prompt)
   return (
     <>
       <label className="p-form-row">
         <span className="p-form-label">名称 *</span>
-        <input className="p-input" value={name} spellCheck={false} onChange={(e) => setName(e.target.value)} />
+        <input className="p-input" value={form.name} spellCheck={false} onChange={(e) => onChange({ ...form, name: e.target.value })} />
       </label>
       <label className="p-form-row">
         <span className="p-form-label">描述</span>
         <input
           className="p-input"
-          value={description}
+          value={form.description}
           spellCheck={false}
-          onChange={(e) => setDescription(e.target.value)}
+          onChange={(e) => onChange({ ...form, description: e.target.value })}
         />
       </label>
       <label className="p-form-row">
         <span className="p-form-label">提示词 *（用 {'{变量}'} 占位，发送前填充）</span>
         <textarea
           className="p-textarea"
-          value={prompt}
+          value={form.prompt}
           spellCheck={false}
-          onChange={(e) => setPrompt(e.target.value)}
+          onChange={(e) => onChange({ ...form, prompt: e.target.value })}
         />
       </label>
+      <details className="p-operation-manual">
+        <summary>场景包操作说明（Markdown，可选）</summary>
+        <p className="p-hint">导出场景包时，这里是依赖、素材与配置迁移说明的唯一来源。</p>
+        <textarea
+          className="p-textarea p-operation-manual__input"
+          value={form.operationManual}
+          placeholder="例如：需要嵌入的 skills、材料目录、目标环境配置步骤与验证方式。"
+          spellCheck={false}
+          onChange={(e) => onChange({ ...form, operationManual: e.target.value })}
+        />
+      </details>
       {vars.length > 0 ? (
         <span className="p-vars">
           变量：
@@ -847,17 +1015,6 @@ function SceneEditor({ scene, existingIds, onCancel, onSave }: {
       ) : (
         <div className="p-hint">无变量：选择后直接填充。</div>
       )}
-      <div className="p-row" style={{ justifyContent: 'flex-end' }}>
-        <button type="button" className="p-btn p-btn--sm" onClick={onCancel}>取消</button>
-        <button
-          type="button"
-          className="p-btn p-btn--sm p-btn--primary"
-          disabled={!name.trim() || !prompt.trim()}
-          onClick={submit}
-        >
-          保存修改
-        </button>
-      </div>
     </>
   )
 }
