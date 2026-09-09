@@ -38,6 +38,7 @@ export function validateScene(raw: unknown): Scene | null {
     prompt: s.prompt,
     operationManual: typeof s.operationManual === 'string' ? s.operationManual : '',
     builtin: s.builtin === true,
+    favorite: s.favorite === true,
     updatedAt: typeof s.updatedAt === 'string' ? s.updatedAt : '',
     ...(typeof s.seedPrompt === 'string' ? { seedPrompt: s.seedPrompt } : {}),
   }
@@ -91,13 +92,13 @@ export function uniqueId(name: string, existingIds: readonly string[]): string {
 
 /**
  * 管理弹窗脏检查：草稿与原始快照是否有未保存的修改（关闭弹窗丢弃守卫用）。
- * 只比较业务字段（id/name/description/prompt/builtin）——updatedAt 由服务端
+ * 只比较业务字段（id/name/description/prompt/builtin/favorite）——updatedAt 由服务端
  * 在落盘时刷新、seedPrompt 是内部基线，都不算用户修改。
  */
 export function hasDirtyScenes(original: readonly Scene[], drafts: readonly Scene[]): boolean {
   if (original.length !== drafts.length) return true
   const key = (s: Scene): string =>
-    JSON.stringify([s.id, s.name, s.description, s.prompt, s.operationManual, s.builtin])
+    JSON.stringify([s.id, s.name, s.description, s.prompt, s.operationManual, s.builtin, s.favorite])
   const baseline = new Set(original.map(key))
   return drafts.some((d) => !baseline.has(key(d)))
 }
@@ -164,6 +165,29 @@ export function filterScenes(scenes: readonly Scene[], query: string): Scene[] {
   if (!q) return [...scenes]
   return scenes.filter((s) =>
     matchesFuzzy(s.name, q) || matchesFuzzy(s.description, q) || matchesFuzzy(s.prompt, q))
+}
+
+/** 稳定显示分组：收藏优先，其次未收藏内置场景，最后为其余场景。 */
+export function sortScenesForDisplay(scenes: readonly Scene[]): Scene[] {
+  const group = (scene: Scene): number => scene.favorite ? 0 : scene.builtin ? 1 : 2
+  return scenes
+    .map((scene, index) => ({ scene, index }))
+    .sort((a, b) => group(a.scene) - group(b.scene) || a.index - b.index)
+    .map(({ scene }) => scene)
+}
+
+/** 对列表分页；页码钳制到有效范围，默认每页十项。 */
+export function paginate<T>(
+  items: readonly T[],
+  page: number,
+  pageSize = 10,
+): { items: T[]; page: number; pageCount: number; total: number } {
+  const total = items.length
+  const size = Number.isFinite(pageSize) && pageSize > 0 ? Math.floor(pageSize) : 10
+  const pageCount = Math.max(1, Math.ceil(total / size))
+  const safePage = Number.isFinite(page) ? Math.min(Math.max(1, Math.floor(page)), pageCount) : 1
+  const start = (safePage - 1) * size
+  return { items: items.slice(start, start + size), page: safePage, pageCount, total }
 }
 
 /** 按查询过滤变量：名称或值命中即算；空查询返回全部。 */

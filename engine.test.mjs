@@ -28,9 +28,12 @@ test('fillPrompt 替换并保留缺失变量', () => {
 })
 
 test('validateScene 校验与场景包说明兼容', () => {
-  const valid = { id: 'a-b', name: 'n', description: '', prompt: 'p', builtin: false, updatedAt: '' }
+  const valid = { id: 'a-b', name: 'n', description: '', prompt: 'p', builtin: false, updatedAt: '', favorite: false }
   assert.deepEqual(validateScene(valid), { ...valid, operationManual: '' })
   assert.deepEqual(validateScene({ ...valid, operationManual: '# 安装说明' }), { ...valid, operationManual: '# 安装说明' })
+  // favorite 缺失归一为 false，显式 true 透传
+  assert.deepEqual(validateScene({ ...valid, favorite: undefined }), { ...valid, operationManual: '' })
+  assert.equal(validateScene({ ...valid, favorite: true }).favorite, true)
   assert.equal(validateScene({ ...valid, operationManual: 1 }), null)
   assert.equal(validateScene({ ...valid, id: 'bad id' }), null)
   assert.equal(validateScene({ ...valid, name: '' }), null)

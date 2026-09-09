@@ -25,7 +25,11 @@ export class SceneStore {
       this.scenes = Array.isArray(raw.scenes)
         ? raw.scenes
           .filter((s) => s && typeof s === 'object' && SAFE_ID.test(s.id) && typeof s.prompt === 'string')
-          .map((s) => ({ ...s, operationManual: typeof s.operationManual === 'string' ? s.operationManual : '' }))
+          .map((s) => ({
+            ...s,
+            operationManual: typeof s.operationManual === 'string' ? s.operationManual : '',
+            favorite: s.favorite === true,
+          }))
         : []
     } catch {
       try { renameSync(this.file, this.file + '.bak') } catch { /* 备份失败不阻断 */ }
@@ -83,6 +87,7 @@ export class SceneStore {
         || prev.prompt !== s.prompt
         || prev.operationManual !== s.operationManual
         || prev.builtin !== s.builtin
+        || prev.favorite !== s.favorite
       return { ...s, updatedAt: contentChanged ? now : (s.updatedAt || now) }
     })
     this.persist()

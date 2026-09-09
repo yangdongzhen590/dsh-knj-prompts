@@ -58,9 +58,10 @@ export const PROMPT_CSS = /* css */ `
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--p-accent) 25%, transparent);
 }
 
-/* 下拉菜单 */
+/* 下拉菜单（加大：更宽更高；操作条 sticky 固定在底部不随列表滚动） */
 .knj-p .p-menu {
-  position: absolute; z-index: 60; min-width: 260px; max-width: 320px; max-height: 380px; overflow: auto;
+  position: absolute; z-index: 60; min-width: 300px; width: min(560px, calc(100vw - 32px));
+  max-height: min(640px, calc(100vh - 120px)); overflow-y: auto;
   background: var(--p-bg-1); border: 1px solid var(--p-border); border-radius: 12px;
   box-shadow: var(--dsw-shadow-lv3, 0 12px 32px rgba(0, 0, 0, 0.2));
   padding: 6px; display: flex; flex-direction: column; gap: 2px;
@@ -73,6 +74,7 @@ export const PROMPT_CSS = /* css */ `
   transition: background .1s ease;
 }
 .knj-p .p-menu-item:hover { background: var(--p-hover); }
+.knj-p .p-menu-item--busy { opacity: .55; cursor: wait; pointer-events: none; }
 .knj-p .p-menu-item__name { font-size: 13px; font-weight: 500; color: var(--p-text); display: flex; align-items: center; gap: 6px; }
 .knj-p .p-menu-item__desc { font-size: 11px; color: var(--p-text-3); }
 .knj-p .p-menu-sep { height: 1px; background: var(--p-border-soft); margin: 4px 2px; }
@@ -80,7 +82,7 @@ export const PROMPT_CSS = /* css */ `
 /* 表单 / modal（三段式：固定头部 + 独立滚动内容区 + 固定底部操作栏） */
 .knj-p .p-modal-mask { position: fixed; inset: 0; z-index: 70; background: rgba(0, 0, 0, 0.45); display: flex; align-items: center; justify-content: center; }
 .knj-p .p-modal {
-  width: min(560px, calc(100vw - 48px)); max-height: 82vh;
+  width: min(1120px, calc(100vw - 48px)); height: min(900px, calc(100vh - 48px)); max-height: calc(100vh - 48px);
   background: var(--p-bg-1); border: 1px solid var(--p-border); border-radius: 14px;
   box-shadow: var(--dsw-shadow-lv3, 0 12px 32px rgba(0, 0, 0, 0.2));
   padding: 18px; display: flex; flex-direction: column; gap: 12px;
@@ -112,7 +114,13 @@ export const PROMPT_CSS = /* css */ `
 .knj-p .p-menu-item:disabled { opacity: .55; cursor: wait; }
 .knj-p .p-empty { padding: 14px 12px; color: var(--p-text-3); text-align: center; }
 .knj-p .p-empty-inline { font-style: normal; color: var(--p-text-3); }
-.knj-p .p-menu-foot { display: flex; justify-content: flex-end; padding: 4px 4px 2px; }
+.knj-p .p-menu-foot { position: sticky; bottom: 0; z-index: 1; display: flex; justify-content: flex-end; padding: 6px 4px 2px; background: var(--p-bg-1); border-top: 1px solid var(--p-border-soft); margin-top: 2px; }
+.knj-p .p-pagination { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 4px; font-size: 11px; color: var(--p-text-3); }
+.knj-p .p-pagination__actions { display: flex; gap: 4px; }
+.knj-p .p-star { margin-left: auto; border: none; background: transparent; color: var(--p-text-3); cursor: pointer; padding: 2px; display: inline-flex; }
+.knj-p .p-star:hover { background: var(--p-hover); color: var(--p-text); }
+.knj-p .p-star--on { color: var(--p-accent); fill: currentColor; }
+.knj-p .p-star--on:hover { color: var(--p-accent); }
 .knj-p .p-tag {
   font-size: 10px; line-height: 14px; padding: 0 5px; border-radius: 4px; flex: none;
   background: color-mix(in srgb, var(--p-accent) 14%, transparent); color: var(--p-accent);

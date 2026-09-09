@@ -14,7 +14,7 @@ test('首次运行 seed 合入且 id 净化', () => {
   const dir = tempRoot()
   const store = new SceneStore(join(dir, 'scenes.json'))
   const scenes = store.list()
-  assert.equal(scenes.length, 4)
+  assert.equal(scenes.length, 6)
   assert.ok(scenes.every((s) => s.builtin === true))
   assert.ok(scenes.every((s) => /^[a-zA-Z0-9\u4e00-\u9fff][a-zA-Z0-9\u4e00-\u9fff-]*$/.test(s.id)))
   rmSync(dir, { recursive: true, force: true })
@@ -40,8 +40,21 @@ test('损坏 JSON 备份后重建为 seed', () => {
   writeFileSync(file, '{broken json', 'utf8')
   const store = new SceneStore(file)
   store.ensureSeeded()
-  assert.equal(store.list().length, 4)
+  assert.equal(store.list().length, 6)
   assert.ok(existsSync(file + '.bak'))
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('旧场景缺 favorite 时加载为 false', () => {
+  const dir = tempRoot()
+  const file = join(dir, 'scenes.json')
+  writeFileSync(file, JSON.stringify({
+    version: 1,
+    scenes: [{ id: 'legacy-scene', name: '旧场景', description: '', prompt: '旧提示词', builtin: false, updatedAt: 't0' }],
+  }), 'utf8')
+  const store = new SceneStore(file)
+  const legacy = store.list().find((scene) => scene.id === 'legacy-scene')
+  assert.equal(legacy.favorite, false)
   rmSync(dir, { recursive: true, force: true })
 })
 

@@ -18,6 +18,8 @@ import {
   fillPrompt,
   filterScenes,
   filterVars,
+  paginate,
+  sortScenesForDisplay,
   hasDirtyScenes,
   hasDirtyVars,
   hasDuplicateVarNames,
@@ -28,7 +30,7 @@ import {
   validateVar,
 } from './engine.ts'
 import type { SceneForm, VarForm } from './engine.ts'
-import { IconChevronDown, IconClose, IconPlus, IconSparkles, IconTrash } from './icons.tsx'
+import { IconChevronDown, IconClose, IconPlus, IconSparkles, IconStar, IconTrash } from './icons.tsx'
 import type { PromptVar, Scene } from '../types.ts'
 
 /** 挂起填充：跨会话切换传递待填文本（模块级，生命周期 = 页面）。 */
@@ -77,6 +79,8 @@ export function ScenePicker(props: ScenePickerProps) {
   const [vars, setVars] = useState<PromptVar[] | null>(null) // 变量库（填充面板下拉候选；null = 未加载/加载失败）
   const [loadErr, setLoadErr] = useState<string | null>(null)
   const [menuQuery, setMenuQuery] = useState('') // 下拉菜单场景搜索词（重开菜单时重置）
+  const [menuPage, setMenuPage] = useState(1)
+  const [exportPage, setExportPage] = useState(1)
   const [fillScene, setFillScene] = useState<Scene | null>(null)
   const [fillValues, setFillValues] = useState<Record<string, string>>({})
   const [uploadingPackage, setUploadingPackage] = useState(false)
@@ -128,6 +132,8 @@ export function ScenePicker(props: ScenePickerProps) {
     setMode('menu')
     setFillScene(null)
     setMenuQuery('') // 重开菜单重置搜索词
+    setMenuPage(1)
+    setExportPage(1)
     const r = btnRef.current?.getBoundingClientRect()
     if (r) {
       // 菜单从按钮上方弹出（输入框位于窗口底部），右对齐按钮
@@ -212,6 +218,16 @@ export function ScenePicker(props: ScenePickerProps) {
     setOpen(false)
   }
 
+  const toggleFavorite = async (id: string) => {
+    if (!scenes) return
+    const next = scenes.map((scene) => scene.id === id ? { ...scene, favorite: !scene.favorite } : scene)
+    try {
+      setScenes(await saveScenes(next))
+    } catch {
+      setLoadErr('收藏保存失败，请重试')
+    }
+  }
+
   const inBlank = props.session?.blank === true
 
   return (
@@ -248,13 +264,13 @@ export function ScenePicker(props: ScenePickerProps) {
           style={{ position: 'fixed', right: `${pos.right}px`, bottom: `${pos.bottom}px` }}
         >
           {mode === 'menu'
-            ? <>{packageError ? <div className="p-banner p-banner--err">{packageError}</div> : null}{renderMenu(scenes, loadErr, menuQuery, setMenuQuery, () => void load(), pick, () => setManage(true), uploadingPackage)}</>
+            ? <>{packageError ? <div className="p-banner p-banner--err">{packageError}</div> : null}{renderMenu(scenes, loadErr, menuQuery, setMenuQuery, menuPage, setMenuPage, () => void load(), pick, toggleFavorite, () => setManage(true), uploadingPackage)}</>
             : null}
           {mode === 'fill' && fillScene
             ? renderFill(fillScene, fillValues, setFillValues, inBlank, () => setMode('menu'), confirmFill, vars)
             : null}
           {mode === 'export-select'
-            ? renderExportSelection(scenes, menuQuery, setMenuQuery, exportScene)
+            ? renderExportSelection(scenes, menuQuery, setMenuQuery, exportPage, setExportPage, exportScene)
             : null}
         </div>
       )}
@@ -277,11 +293,14 @@ function renderExportSelection(
   scenes: Scene[] | null,
   query: string,
   setQuery: (q: string) => void,
+  page: number,
+  setPage: (page: number) => void,
   exportScene: (scene: Scene) => void,
 ) {
   if (!scenes) return <div className="p-empty">加载场景中…</div>
   const ordinary = scenes.filter((scene) => !scene.builtin)
-  const filtered = filterScenes(ordinary, query)
+  const filtered = sortScenesForDisplay(filterScenes(ordinary, query))
+  const pageData = paginate(filtered, page)
   return (
     <>
       <div className="p-menu-title">选择要导出的场景</div>
@@ -292,15 +311,16 @@ function renderExportSelection(
         placeholder="搜索普通场景"
         spellCheck={false}
         autoFocus
-        onChange={(e) => setQuery(e.target.value)}
+        onChange={(e) => { setQuery(e.target.value); setPage(1) }}
       />
-      {filtered.map((scene) => (
+      {pageData.items.map((scene) => (
         <button key={scene.id} type="button" className="p-menu-item" onClick={() => exportScene(scene)}>
           <span className="p-menu-item__name">{scene.name}</span>
           {scene.description ? <span className="p-menu-item__desc">{scene.description}</span> : null}
         </button>
       ))}
       {filtered.length === 0 ? <div className="p-empty">没有可导出的普通场景</div> : null}
+      {filtered.length > 0 ? <Pagination page={pageData.page} pageCount={pageData.pageCount} total={pageData.total} onPage={setPage} /> : null}
     </>
   )
 }
@@ -311,8 +331,11 @@ function renderMenu(
   loadErr: string | null,
   query: string,
   setQuery: (q: string) => void,
+  page: number,
+  setPage: (page: number) => void,
   retry: () => void,
   pick: (s: Scene) => void,
+  toggleFavorite: (id: string) => void,
   openManage: () => void,
   uploadingPackage: boolean,
 ) {
@@ -340,7 +363,8 @@ function renderMenu(
       </>
     )
   }
-  const filtered = filterScenes(scenes, query)
+  const filtered = sortScenesForDisplay(filterScenes(scenes, query))
+  const pageData = paginate(filtered, page)
   return (
     <>
       <input
@@ -348,15 +372,16 @@ function renderMenu(
         value={query}
         placeholder="搜索场景（名称/描述/提示词）"
         spellCheck={false}
-        onChange={(e) => setQuery(e.target.value)}
+        onChange={(e) => { setQuery(e.target.value); setPage(1) }}
       />
-      {filtered.map((s) => {
+      {pageData.items.map((s) => {
         const vars = extractVariables(s.prompt)
         return (
-          <button key={s.id} type="button" className="p-menu-item" disabled={uploadingPackage} onClick={() => pick(s)}>
+          <div key={s.id} role="button" tabIndex={uploadingPackage ? -1 : 0} aria-disabled={uploadingPackage} className={uploadingPackage ? 'p-menu-item p-menu-item--busy' : 'p-menu-item'} onClick={() => { if (!uploadingPackage) pick(s) }} onKeyDown={(event) => { if (!uploadingPackage && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); pick(s) } }}>
             <span className="p-menu-item__name">
               {s.name}
               {s.builtin ? <span className="p-tag">内置</span> : null}
+              <button type="button" className={s.favorite ? 'p-star p-star--on' : 'p-star'} aria-label={s.favorite ? `取消收藏 ${s.name}` : `收藏 ${s.name}`} onClick={(event) => { event.stopPropagation(); toggleFavorite(s.id) }}><IconStar size={13} /></button>
             </span>
             {s.description ? <span className="p-menu-item__desc">{s.description}</span> : null}
             {vars.length > 0 ? (
@@ -366,10 +391,11 @@ function renderMenu(
                 ))}
               </span>
             ) : null}
-          </button>
+          </div>
         )
       })}
       {filtered.length === 0 ? <div className="p-empty">没有匹配的场景</div> : null}
+      {filtered.length > 0 ? <Pagination page={pageData.page} pageCount={pageData.pageCount} total={pageData.total} onPage={setPage} /> : null}
       <div className="p-menu-sep" />
       <div className="p-menu-foot">
         <button type="button" className="p-btn p-btn--sm" onClick={openManage}>
@@ -379,6 +405,10 @@ function renderMenu(
       </div>
     </>
   )
+}
+
+function Pagination({ page, pageCount, total, onPage }: { page: number; pageCount: number; total: number; onPage: (page: number) => void }) {
+  return <div className="p-pagination"><span>共 {total} 条 · 第 {page} / {pageCount} 页</span><span className="p-pagination__actions"><button type="button" className="p-btn p-btn--sm" disabled={page <= 1} onClick={() => onPage(page - 1)}>上一页</button><button type="button" className="p-btn p-btn--sm" disabled={page >= pageCount} onClick={() => onPage(page + 1)}>下一页</button></span></div>
 }
 
 /** 变量填充面板：逐变量输入（变量库非空时提供「选已配置变量取值」的可搜索下拉）+ 实时预览。 */
@@ -501,7 +531,7 @@ function VarValueInput({ value, vars, onChange }: {
 
 /** 新场景草稿（id 由保存时 uniqueId 生成）。 */
 function newDraft(): Scene {
-  return { id: '', name: '', description: '', prompt: '', operationManual: '', builtin: false, updatedAt: '' }
+  return { id: '', name: '', description: '', prompt: '', operationManual: '', builtin: false, favorite: false, updatedAt: '' }
 }
 
 /** 管理弹窗：场景 / 变量库 两个页签。两者均为单步保存（保存修改/删除 = 立即 PUT 落盘）。
@@ -523,10 +553,15 @@ export function ManageModal({ scenes, vars, onClose, onSaved, onVarsSaved }: {
   const [banner, setBanner] = useState<{ ok: boolean; text: string } | null>(null)
   const [saving, setSaving] = useState(false)
   const [sceneQuery, setSceneQuery] = useState('') // 场景列表搜索词
+  const [scenePage, setScenePage] = useState(1)
   // 编辑表单（受控；保存/取消入口在固定底部操作栏）。进入编辑器时由 sel 同步一次。
   const [editForm, setEditForm] = useState<SceneForm | null>(null)
 
   const dirty = hasDirtyScenes(scenes, drafts)
+
+  // 场景列表显示链：过滤 → 稳定分组排序 → 每页 10 条（favorite 优先、内置其次）
+  const sceneSearchHits = filterScenes(drafts, sceneQuery)
+  const scenePageData = paginate(sortScenesForDisplay(sceneSearchHits), scenePage)
 
   const editing: Scene | null =
     sel === null ? null : sel === 'new' ? newDraft() : (drafts.find((d) => d.id === sel) ?? null)
@@ -646,11 +681,11 @@ export function ManageModal({ scenes, vars, onClose, onSaved, onVarsSaved }: {
                       value={sceneQuery}
                       placeholder="搜索场景（名称/描述/提示词）"
                       spellCheck={false}
-                      onChange={(e) => setSceneQuery(e.target.value)}
+                      onChange={(e) => { setSceneQuery(e.target.value); setScenePage(1) }}
                     />
                   ) : null}
                   <div className="p-manage-list">
-                    {filterScenes(drafts, sceneQuery).map((d) => {
+                    {scenePageData.items.map((d) => {
                       const varsInPrompt = extractVariables(d.prompt)
                       return (
                         <div key={d.id} className="p-manage-row">
@@ -658,6 +693,7 @@ export function ManageModal({ scenes, vars, onClose, onSaved, onVarsSaved }: {
                             <span className="p-manage-name">
                               {d.name || <em className="p-empty-inline">（未命名）</em>}
                               {d.builtin ? <span className="p-tag">内置</span> : null}
+                               <button type="button" className={d.favorite ? 'p-star p-star--on' : 'p-star'} aria-label={d.favorite ? `取消收藏 ${d.name}` : `收藏 ${d.name}`} onClick={() => { const next = drafts.map((item) => item.id === d.id ? { ...item, favorite: !item.favorite } : item); setDrafts(next); void persist(next) }}><IconStar size={13} /></button>
                             </span>
                             {d.description ? <span className="p-manage-desc">{d.description}</span> : null}
                             {varsInPrompt.length > 0 ? (
@@ -684,8 +720,9 @@ export function ManageModal({ scenes, vars, onClose, onSaved, onVarsSaved }: {
                         </div>
                       )
                     })}
+                    {sceneSearchHits.length > 0 ? <Pagination page={scenePageData.page} pageCount={scenePageData.pageCount} total={scenePageData.total} onPage={setScenePage} /> : null}
                     {drafts.length === 0 ? <div className="p-empty">还没有场景</div> : null}
-                    {drafts.length > 0 && filterScenes(drafts, sceneQuery).length === 0 ? (
+                    {drafts.length > 0 && sceneSearchHits.length === 0 ? (
                       <div className="p-empty">没有匹配的场景</div>
                     ) : null}
                   </div>

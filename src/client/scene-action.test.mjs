@@ -3,7 +3,33 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
-import { buildScenePackageExportDraft, resolveSceneAction, uniqueId, isPendingFillEligible, hasDirtyScenes, applyDraftEdit, applyDraftRemove, PENDING_TTL_MS, PENDING_ARRIVAL_MS } from './engine.ts'
+import { buildScenePackageExportDraft, resolveSceneAction, uniqueId, isPendingFillEligible, hasDirtyScenes, applyDraftEdit, applyDraftRemove, sortScenesForDisplay, paginate, PENDING_TTL_MS, PENDING_ARRIVAL_MS } from './engine.ts'
+
+test('sortScenesForDisplay 稳定地按 favorite、内置、其余分组', () => {
+  const scenes = [
+    { id: 'ordinary-1', name: '普通一', description: '', prompt: 'p', operationManual: '', favorite: false, builtin: false, updatedAt: '' },
+    { id: 'builtin-1', name: '内置一', description: '', prompt: 'p', operationManual: '', favorite: false, builtin: true, updatedAt: '' },
+    { id: 'favorite-1', name: '收藏一', description: '', prompt: 'p', operationManual: '', favorite: true, builtin: false, updatedAt: '' },
+    { id: 'builtin-2', name: '内置二', description: '', prompt: 'p', operationManual: '', favorite: false, builtin: true, updatedAt: '' },
+    { id: 'favorite-2', name: '收藏二', description: '', prompt: 'p', operationManual: '', favorite: true, builtin: true, updatedAt: '' },
+    { id: 'ordinary-2', name: '普通二', description: '', prompt: 'p', operationManual: '', favorite: false, builtin: false, updatedAt: '' },
+  ]
+  assert.deepEqual(sortScenesForDisplay(scenes).map((scene) => scene.id), [
+    'favorite-1', 'favorite-2', 'builtin-1', 'builtin-2', 'ordinary-1', 'ordinary-2',
+  ])
+  assert.deepEqual(scenes.map((scene) => scene.id), [
+    'ordinary-1', 'builtin-1', 'favorite-1', 'builtin-2', 'favorite-2', 'ordinary-2',
+  ])
+})
+
+test('paginate 默认每页十条并钳制页码', () => {
+  const items = Array.from({ length: 21 }, (_, index) => index + 1)
+  assert.deepEqual(paginate(items, 1), { items: items.slice(0, 10), page: 1, pageCount: 3, total: 21 })
+  assert.deepEqual(paginate(items, 2), { items: items.slice(10, 20), page: 2, pageCount: 3, total: 21 })
+  assert.deepEqual(paginate(items, 3), { items: items.slice(20), page: 3, pageCount: 3, total: 21 })
+  assert.equal(paginate(items, 99).page, 3)
+  assert.equal(paginate(items, 0).page, 1)
+})
 
 test('ScenePicker 在当前宿主未注入 InputZone owner share 时原地填入草稿', async () => {
   const source = await readFile(new URL('./ScenePicker.tsx', import.meta.url), 'utf8')
@@ -15,7 +41,7 @@ test('ScenePicker 的导出选择仅列出普通场景，点击后将选中场�
   const source = await readFile(new URL('./ScenePicker.tsx', import.meta.url), 'utf8')
   assert.match(source, /type PickerMode = 'menu' \| 'fill' \| 'export-select'/)
   assert.match(source, /if \(s\.id === 'export-scene-package'\) \{\s*setMenuQuery\(''\)\s*setMode\('export-select'\)\s*return\s*\}/s)
-  assert.match(source, /renderExportSelection\(scenes, menuQuery, setMenuQuery, exportScene\)/)
+  assert.match(source, /renderExportSelection\(scenes, menuQuery, setMenuQuery, exportPage, setExportPage, exportScene\)/)
   assert.match(source, /scenes\.filter\(\(scene\) => !scene\.builtin\)/)
 
   const ordinary = { id: 'my-scene', name: '我的场景', description: '场景描述', prompt: '执行 {任务}', operationManual: '# 操作', builtin: false, updatedAt: '' }
@@ -108,4 +134,22 @@ test('applyDraftEdit / applyDraftRemove 管理弹窗草稿写回（单步保存�
   assert.equal(removed.length, 1)
   assert.equal(removed[0].id, 'b')
   assert.equal(base.length, 2)
+})
+
+test('三个场景列表都按收藏排序 + 每页 10 条分页', async () => {
+  const source = await readFile(new URL('./ScenePicker.tsx', import.meta.url), 'utf8')
+  // 下拉菜单：独立页码状态、渲染时排序后分页、行内收藏星标（点击不触发选中）
+  assert.match(source, /const \[menuPage, setMenuPage\] = useState\(1\)/)
+  assert.match(source, /sortScenesForDisplay\(filterScenes\(scenes, query\)\)/)
+  assert.match(source, /event\.stopPropagation\(\);\s*toggleFavorite\(s\.id\)/)
+  assert.match(source, /aria-label=\{s\.favorite \? `取消收藏 \$\{s\.name\}` : `收藏 \$\{s\.name\}`\}/)
+  // 导出选择：普通场景过滤后同样排序分页
+  assert.match(source, /sortScenesForDisplay\(filterScenes\(ordinary, query\)\)/)
+  assert.match(source, /const pageData = paginate\(filtered, page\)/)
+  // 管理弹窗：列表视图排序分页 + 固定底部保留「新增场景」
+  assert.match(source, /const scenePageData = paginate\(sortScenesForDisplay\(sceneSearchHits\), scenePage\)/)
+  assert.match(source, /scenePageData\.items\.map/)
+  assert.match(source, /新增场景/)
+  // 收藏星标按钮共用的 aria-label 出现在管理行内（d.favorite 分支）
+  assert.match(source, /aria-label=\{d\.favorite \? `取消收藏 \$\{d\.name\}` : `收藏 \$\{d\.name\}`\}/)
 })
