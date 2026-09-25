@@ -1,6 +1,6 @@
 // src/client/engine.ts
 // 场景引擎纯函数：变量提取/替换、场景校验、id 净化、变量库校验。浏览器与测试共用。
-import { SAFE_ID, type PromptVar, type Scene } from '../types.ts'
+import { SAFE_ID, normalizeVarOptions, type PromptVar, type Scene, type VarOption } from '../types.ts'
 
 /** 变量占位符：{名称} */
 export const VAR_RE = /[{]([^{}]+)[}]/g
@@ -113,17 +113,58 @@ export function applyDraftRemove(drafts: readonly Scene[], id: string): Scene[] 
   return drafts.filter((d) => d.id !== id)
 }
 
-/** 校验变量条目：name 与 value 均非空（trim 后）→ PromptVar；否则 null。 */
+/** 校验变量条目：名称必填；枚举条目（options 非空）允许 value 为空，单值条目 value 必填。 */
 export function validateVar(raw: unknown): PromptVar | null {
   if (!raw || typeof raw !== 'object') return null
   const v = raw as Record<string, unknown>
   if (typeof v.name !== 'string' || !v.name.trim()) return null
-  if (typeof v.value !== 'string' || !v.value.trim()) return null
-  return {
-    name: v.name.trim(),
-    value: v.value.trim(),
-    updatedAt: typeof v.updatedAt === 'string' ? v.updatedAt : '',
+  if (v.options !== undefined && v.options !== null && !Array.isArray(v.options)) return null
+  const rawOptions = Array.isArray(v.options) ? v.options : []
+  const value = typeof v.value === 'string' ? v.value.trim() : ''
+  const updatedAt = typeof v.updatedAt === 'string' ? v.updatedAt : ''
+  if (rawOptions.length > 0) {
+    const options = normalizeVarOptions(rawOptions)
+    // 有选项但存在缺值项 → 整条拒绝，不静默丢弃用户数据
+    if (options.length !== rawOptions.length) return null
+    return { name: v.name.trim(), value, options, updatedAt }
   }
+  if (!value) return null
+  return { name: v.name.trim(), value, updatedAt }
+}
+
+/** 是否为枚举变量（至少一个合法候选项）。 */
+export function isEnumVar(v: PromptVar): boolean {
+  return normalizeVarOptions(v.options).length > 0
+}
+
+/** 归一后的枚举候选项；单值变量返回空数组。 */
+export function varOptions(v: PromptVar): VarOption[] {
+  return normalizeVarOptions(v.options)
+}
+
+/**
+ * 级联第一级：可选变量列表（先选变量，再选值）。
+ * 过滤通道：变量名命中，或其枚举显示名/实际值命中（便于一步直达所属变量）。
+ * 无值且无选项的空变量不出现；null 变量库返回空列表。
+ */
+export function varPickGroups(vars: readonly PromptVar[] | null, query: string): PromptVar[] {
+  if (!vars) return []
+  const usable = vars.filter((v) => normalizeVarOptions(v.options).length > 0 || v.value.trim().length > 0)
+  const q = query.trim().toLowerCase()
+  if (!q) return usable
+  return usable.filter((v) => {
+    if (v.name.toLowerCase().includes(q)) return true
+    if (v.value.toLowerCase().includes(q)) return true
+    return normalizeVarOptions(v.options).some((o) => o.label.toLowerCase().includes(q) || o.value.toLowerCase().includes(q))
+  })
+}
+
+/** 级联第二级：某变量的可选值（枚举候选，按显示名/实际值过滤）；单值变量返回空数组。 */
+export function varPickOptions(v: PromptVar, query: string): VarOption[] {
+  const options = normalizeVarOptions(v.options)
+  const q = query.trim().toLowerCase()
+  if (!q) return options
+  return options.filter((o) => o.label.toLowerCase().includes(q) || o.value.toLowerCase().includes(q))
 }
 
 /** 变量名是否重复（大小写不敏感）：PUT 前拦截，防止同名覆盖歧义。 */
@@ -144,10 +185,11 @@ export function findVar(vars: readonly PromptVar[] | null, name: string): Prompt
   return vars.find((v) => v.name.toLowerCase() === key) ?? null
 }
 
-/** 变量库脏检查：比较业务字段（name/value），updatedAt 不算用户修改。 */
+/** 变量库脏检查：比较业务字段（name/value/options），updatedAt 不算用户修改。 */
 export function hasDirtyVars(original: readonly PromptVar[], drafts: readonly PromptVar[]): boolean {
   if (original.length !== drafts.length) return true
-  const key = (v: PromptVar): string => JSON.stringify([v.name.toLowerCase(), v.value])
+  const key = (v: PromptVar): string =>
+    JSON.stringify([v.name.toLowerCase(), v.value, normalizeVarOptions(v.options)])
   const baseline = new Set(original.map(key))
   return drafts.some((d) => !baseline.has(key(d)))
 }
@@ -216,12 +258,27 @@ export function buildSceneEdit(base: Scene, form: SceneForm, existingIds: readon
   }
 }
 
-/** 变量编辑表单（管理弹窗固定底部操作栏的受控输入）。 */
-export interface VarForm { name: string; value: string }
+/** 变量编辑表单（管理弹窗固定底部操作栏的受控输入）。options 空数组 = 单值变量。 */
+export interface VarForm { name: string; value: string; options: VarOption[] }
 
-/** 把变量编辑表单合并进变量条目（name/value 去空白）。 */
+/**
+ * 把变量编辑表单合并进变量条目：name/value 去空白，选项归一。
+ * 选项为空时不再落 options 字段（回到单值语义），避免残留旧枚举。
+ */
 export function buildVarEdit(base: PromptVar, form: VarForm): PromptVar {
-  return { ...base, name: form.name.trim(), value: form.value.trim() }
+  const options = normalizeVarOptions(form.options)
+  const next: PromptVar = { name: form.name.trim(), value: form.value.trim(), updatedAt: base.updatedAt }
+  if (options.length > 0) next.options = options
+  return next
+}
+
+/** 表单是否可保存：名称必填；枚举需至少一个带值选项，且不允许存在缺值选项行。 */
+export function validateVarForm(form: VarForm | null): boolean {
+  if (!form) return false
+  if (!form.name.trim()) return false
+  const rows = Array.isArray(form.options) ? form.options : []
+  if (rows.length > 0) return normalizeVarOptions(rows).length === rows.length
+  return form.value.trim().length > 0
 }
 
 /** 挂起填充有效期：超过后丢弃（startSession 失败时不误填之后手动新建的会话）。 */

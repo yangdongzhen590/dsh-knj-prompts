@@ -22,58 +22,54 @@ export interface Scene {
 export const SAFE_ID = /^[a-zA-Z0-9\u4e00-\u9fff][a-zA-Z0-9\u4e00-\u9fff-]*$/
 
 /**
- * 全局可复用变量（变量库/环境变量）：名称 → 单个值（NAME=VALUE 语义）。
- * name 为唯一键（大小写不敏感）；填充场景时下拉选择变量，取其 value 填入占位符。
+ * 全局可复用变量（变量库/环境变量）：名称 → 值。
+ * - 单值变量（主流形式）：NAME=VALUE 语义，name 为唯一键（大小写不敏感）；
+ * - 枚举变量：options 非空，每项含显示名 label 与实际插入值 value，填充时下拉选择。
  * 旧格式 values[] 由 VarStore.load 自动迁移为 value（取第一个非空值）。
  */
 export interface PromptVar {
   name: string
   value: string
+  /** 枚举候选（顺序即展示顺序）；缺省或空数组 = 单值变量。枚举变量的 value 可为空。 */
+  options?: VarOption[]
   updatedAt: string
 }
 
-/** 内置场景 seed（首版 4 个）。updatedAt 用 epoch 标记"未编辑"。 */
+/** 枚举变量候选项：label 显示名（可空，回退为 value）、value 实际插入值（必填）。 */
+export interface VarOption {
+  label: string
+  value: string
+}
+
+/**
+ * 归一枚举候选：丢弃非对象条目与空 value 项，空 label 回退为 value。
+ * 加载、校验、保存共用同一套规则，避免各处对「合法选项」判断不一致。
+ */
+export function normalizeVarOptions(raw: unknown): VarOption[] {
+  if (!Array.isArray(raw)) return []
+  const out: VarOption[] = []
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue
+    const rec = item as Record<string, unknown>
+    const value = typeof rec.value === 'string' ? rec.value.trim() : ''
+    if (!value) continue
+    const label = typeof rec.label === 'string' && rec.label.trim() ? rec.label.trim() : value
+    out.push({ label, value })
+  }
+  return out
+}
+
+/**
+ * 内置场景 seed。
+ *
+ * 只保留「导出场景包」「安装场景包」两个——它们是插件自身工作流的一部分（场景包的
+ * 导出/安装需要 AI 引导），随插件一起交付；其余通用提示词场景不再内置，用户可按需自建。
+ * updatedAt 用 epoch 标记"未编辑"。
+ *
+ * 注意：从 seed 列表移除的旧内置场景由 SceneStore.ensureSeeded 回收——
+ * 用户未编辑过的直接移除，编辑过的降级为普通场景（不丢用户内容）。
+ */
 export const SEED_SCENES: Scene[] = [
-  {
-    id: 'knowledge-retrieval',
-    name: '知识检索',
-    description: '分层检索当前知识库并合成带引用的回答',
-    prompt: '用 wiki_query 分层检索当前知识库：{主题}。请按标题/标签→正文→图谱邻居的顺序检索，基于候选页合成带引用的回答；无匹配时明确说明，并建议把相关内容吸收进 wiki。',
-    operationManual: '',
-    builtin: true,
-    favorite: false,
-    updatedAt: new Date(0).toISOString(),
-  },
-  {
-    id: 'code-review',
-    name: '代码审查',
-    description: '按四维输出问题清单',
-    prompt: '审查以下代码范围：{范围}。按 规格符合性 / 实现质量 / 边界与错误处理 / 安全 四个维度输出问题清单（严重/一般/建议，每条附证据）。',
-    operationManual: '',
-    builtin: true,
-    favorite: false,
-    updatedAt: new Date(0).toISOString(),
-  },
-  {
-    id: 'architecture-design',
-    name: '架构设计',
-    description: '需求 → 方案权衡 → 模块划分',
-    prompt: '为 {需求} 做架构设计：约束与上下文 → 2-3 个候选方案权衡 → 推荐方案 → 模块划分与接口 → 风险与验证方式。',
-    operationManual: '',
-    builtin: true,
-    favorite: false,
-    updatedAt: new Date(0).toISOString(),
-  },
-  {
-    id: 'requirement-breakdown',
-    name: '需求拆解',
-    description: '模糊需求 → 可执行任务清单',
-    prompt: '把以下需求拆成可执行任务清单：{需求}。按依赖顺序输出，每项含验收标准与失败模式，标注优先级。',
-    operationManual: '',
-    builtin: true,
-    favorite: false,
-    updatedAt: new Date(0).toISOString(),
-  },
   {
     id: 'export-scene-package',
     name: '导出场景包',

@@ -5,16 +5,23 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import type { PromptVar } from './types.ts'
+import { normalizeVarOptions } from './types.ts'
 
-/** 旧格式 values[] → value：取第一个非空字符串（trim 后），无则 null（条目作废）。 */
+/**
+ * 旧格式 values[] → value：取第一个非空字符串（trim 后），无则 null（条目作废）。
+ * 枚举条目（options 非空）允许 value 为空：此时 value 视为「未选默认值」。
+ */
 function migrateLegacy(raw: Record<string, unknown>): PromptVar | null {
   const name = typeof raw.name === 'string' ? raw.name.trim() : ''
   if (!name) return null
   const updatedAt = typeof raw.updatedAt === 'string' ? raw.updatedAt : ''
-  if (typeof raw.value === 'string') {
-    if (!raw.value.trim()) return null
-    return { name, value: raw.value.trim(), updatedAt }
+  const options = normalizeVarOptions(raw.options)
+  if (typeof raw.value === 'string' && raw.value.trim()) {
+    return options.length > 0
+      ? { name, value: raw.value.trim(), options, updatedAt }
+      : { name, value: raw.value.trim(), updatedAt }
   }
+  if (options.length > 0) return { name, value: '', options, updatedAt } // 枚举：value 可空
   // 旧格式：values 数组 → 取第一个非空值
   if (Array.isArray(raw.values)) {
     const first = raw.values.find((x) => typeof x === 'string' && x.trim())
@@ -69,6 +76,7 @@ export class VarStore {
       const contentChanged = !prev
         || prev.name !== v.name
         || prev.value !== v.value
+        || JSON.stringify(prev.options ?? []) !== JSON.stringify(v.options ?? [])
       return { ...v, updatedAt: contentChanged ? now : (v.updatedAt || now) }
     })
     this.persist()

@@ -18,6 +18,9 @@ import {
   fillPrompt,
   filterScenes,
   filterVars,
+  findVar,
+  varPickGroups,
+  varPickOptions,
   paginate,
   sortScenesForDisplay,
   hasDirtyScenes,
@@ -28,10 +31,13 @@ import {
   resolveSceneAction,
   validateScene,
   validateVar,
+  validateVarForm,
+  isEnumVar,
+  varOptions,
 } from './engine.ts'
 import type { SceneForm, VarForm } from './engine.ts'
 import { IconChevronDown, IconClose, IconPlus, IconSparkles, IconStar, IconTrash } from './icons.tsx'
-import type { PromptVar, Scene } from '../types.ts'
+import type { PromptVar, Scene, VarOption } from '../types.ts'
 
 /** 挂起填充：跨会话切换传递待填文本（模块级，生命周期 = 页面）。 */
 interface PendingFill { text: string; at: number; fromSessionId?: string }
@@ -433,26 +439,39 @@ function renderFill(
         </button>
       </div>
       <div className="p-fill-body">
-        {vars.map((v) => (
-          <label key={v} className="p-form-row">
-            <span className="p-form-label">{`{${v}}`}</span>
-            {hasLib ? (
-              <VarValueInput
-                value={values[v] ?? ''}
-                vars={lib}
-                onChange={(val) => setValues({ ...values, [v]: val })}
-              />
-            ) : (
-              <input
-                className="p-input"
-                value={values[v] ?? ''}
-                placeholder={v}
-                spellCheck={false}
-                onChange={(e) => setValues({ ...values, [v]: e.target.value })}
-              />
-            )}
-          </label>
-        ))}
+        {vars.map((v) => {
+          const entry = findVar(lib, v)
+          const enumOptions = entry && isEnumVar(entry) ? varOptions(entry) : []
+          const value = values[v] ?? ''
+          return (
+            <label key={v} className="p-form-row">
+              <span className="p-form-label">
+                {`{${v}}`}
+                {enumOptions.length > 0 ? <span className="p-tag">枚举 {enumOptions.length}</span> : null}
+              </span>
+              {enumOptions.length > 0 ? (
+                <EnumVarInput options={enumOptions} value={value} onChange={(val) => setValues({ ...values, [v]: val })} />
+              ) : hasLib ? (
+                <VarValueInput
+                  value={value}
+                  vars={lib}
+                  onChange={(val) => setValues({ ...values, [v]: val })}
+                />
+              ) : (
+                <input
+                  className="p-input"
+                  value={value}
+                  placeholder={v}
+                  spellCheck={false}
+                  onChange={(e) => setValues({ ...values, [v]: e.target.value })}
+                />
+              )}
+              {enumOptions.length > 0 && value === '' ? (
+                <span className="p-hint">必选：未选择时保留 {`{${v}}`} 占位，不会插入任何值。</span>
+              ) : null}
+            </label>
+          )
+        })}
         <div className="p-preview">{preview}</div>
       </div>
       <div className="p-fill-foot">
@@ -465,8 +484,11 @@ function renderFill(
   )
 }
 
-/** 可搜索变量下拉：聚焦列出全部已配置变量（「名称 = 值」），输入即子串过滤，选中取该变量的值填入；
- *  仍可自由输入任意值。下拉用 fixed 定位，避免被外层滚动容器（p-menu）裁剪。 */
+/** 可搜索变量值下拉（级联）：第一级选变量，第二级选该变量的具体值。
+ *  - 单值变量：点变量即插入其值（无第二级）；
+ *  - 枚举变量：点变量进入第二级，列出「显示名 = 实际值」供选择，可返回上一级；
+ *  - 两级都支持子串过滤（第一级也可直接用枚举显示名/实际值定位到所属变量）；
+ *  - 仍可自由输入任意值。下拉用 fixed 定位，避免被外层滚动容器（p-menu）裁剪。 */
 function VarValueInput({ value, vars, onChange }: {
   value: string
   vars: PromptVar[]
@@ -474,11 +496,14 @@ function VarValueInput({ value, vars, onChange }: {
 }) {
   const [open, setOpen] = useState(false)
   const [query, setQuery] = useState('')
+  const [pickedVar, setPickedVar] = useState<string | null>(null) // 第二级：已选变量名
   const wrapRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
   const [popPos, setPopPos] = useState<{ left: number; top: number; width: number } | null>(null)
 
-  const filtered = filterVars(vars, query)
+  const groups = varPickGroups(vars, query)
+  const activeVar = pickedVar === null ? null : (vars.find((v) => v.name === pickedVar) ?? null)
+  const options = activeVar ? varPickOptions(activeVar, query) : []
 
   // 外点关闭
   useEffect(() => {
@@ -495,7 +520,16 @@ function VarValueInput({ value, vars, onChange }: {
     if (!r) return
     setPopPos({ left: r.left, top: r.bottom + 4, width: Math.max(r.width, 260) })
     setQuery('')
+    setPickedVar(null)
     setOpen(true)
+  }
+
+  /** 第一级点击：枚举变量进第二级，单值变量直接插入。 */
+  const pickVar = (v: PromptVar): void => {
+    const count = varOptions(v).length
+    if (count > 0) { setPickedVar(v.name); setQuery(''); return }
+    onChange(v.value)
+    setOpen(false)
   }
 
   return (
@@ -504,27 +538,103 @@ function VarValueInput({ value, vars, onChange }: {
         ref={inputRef}
         className="p-input"
         value={value}
-        placeholder="下拉选变量取其值，或直接输入"
+        placeholder="下拉先选变量、再选具体值，或直接输入"
         spellCheck={false}
         onFocus={openPop}
         onChange={(e) => { onChange(e.target.value); setQuery(e.target.value); setOpen(true) }}
       />
-      {open && popPos && filtered.length > 0 && (
+      {open && popPos && (
         <div className="p-combo-pop" style={{ position: 'fixed', left: popPos.left, top: popPos.top, width: popPos.width }}>
-          {filtered.map((v) => (
-            <button
-              key={v.name}
-              type="button"
-              className="p-combo-item"
-              title={`用「${v.name}」的值填充`}
-              onClick={() => { onChange(v.value); setOpen(false) }}
-            >
-              <span className="p-combo-item__name">{v.name}</span>
-              <span className="p-combo-item__val">= {v.value}</span>
-            </button>
-          ))}
+          {activeVar ? (
+            <>
+              <button type="button" className="p-combo-head" title="返回变量列表" onClick={() => { setPickedVar(null); setQuery('') }}>
+                <span className="p-combo-head__back">←</span>
+                <span className="p-combo-head__name">{activeVar.name}</span>
+                <span className="p-combo-head__hint">选择具体值</span>
+              </button>
+              {options.map((o) => (
+                <button
+                  key={o.value}
+                  type="button"
+                  className="p-combo-item"
+                  title={`用「${o.label}」的值填充`}
+                  onClick={() => { onChange(o.value); setOpen(false) }}
+                >
+                  <span className="p-combo-item__name">{o.label}</span>
+                  <span className="p-combo-item__val">= {o.value}</span>
+                </button>
+              ))}
+              {options.length === 0 ? <div className="p-combo-empty">没有匹配的值</div> : null}
+            </>
+          ) : (
+            <>
+              {groups.map((v) => {
+                const count = varOptions(v).length
+                return (
+                  <button
+                    key={v.name}
+                    type="button"
+                    className="p-combo-item"
+                    title={count > 0 ? `展开「${v.name}」的可选值` : `用「${v.name}」的值填充`}
+                    onClick={() => pickVar(v)}
+                  >
+                    <span className="p-combo-item__name">{v.name}</span>
+                    <span className="p-combo-item__val">{count > 0 ? `${count} 个可选值 ›` : `= ${v.value}`}</span>
+                  </button>
+                )
+              })}
+              {groups.length === 0 ? <div className="p-combo-empty">没有匹配的变量</div> : null}
+            </>
+          )}
         </div>
       )}
+    </div>
+  )
+}
+
+/** 枚举变量输入：下拉列出候选项显示名（插入的是实际值），并支持「自定义…」自由输入。
+ *  未选择时 value 为空 → fillPrompt 保留 {变量} 占位（配合「必选」提示）。 */
+function EnumVarInput({ options, value, onChange }: {
+  options: VarOption[]
+  value: string
+  onChange: (v: string) => void
+}) {
+  const [customMode, setCustomMode] = useState(false)
+  const matched = options.some((o) => o.value === value)
+  const custom = customMode || (value !== '' && !matched)
+  return (
+    <div className="p-enum">
+      <select
+        role="combobox"
+        aria-label="选择枚举值"
+        className="p-input p-select"
+        value={custom ? '__custom__' : value}
+        onChange={(e) => {
+          const next = e.target.value
+          if (next === '__custom__') {
+            setCustomMode(true)
+            onChange('')
+            return
+          }
+          setCustomMode(false)
+          onChange(next)
+        }}
+      >
+        <option value="">请选择…</option>
+        {options.map((o) => (
+          <option key={o.value} value={o.value}>{o.label}</option>
+        ))}
+        <option value="__custom__">自定义…</option>
+      </select>
+      {custom ? (
+        <input
+          className="p-input"
+          value={value}
+          placeholder="自定义值"
+          spellCheck={false}
+          onChange={(e) => onChange(e.target.value)}
+        />
+      ) : null}
     </div>
   )
 }
@@ -821,7 +931,7 @@ function VarManager({ vars, onSaved, onClose, onDirtyChange }: {
     const base = sel === 'new'
       ? { name: '', value: '', updatedAt: '' }
       : (drafts.find((d) => d.name.toLowerCase() === sel.toLowerCase()) ?? null)
-    if (base) setEditForm({ name: base.name, value: base.value })
+    if (base) setEditForm({ name: base.name, value: base.value, options: varOptions(base) })
   }, [sel])
 
   /** 单步落盘：校验 → PUT → 反馈（与场景页同款）。 */
@@ -863,6 +973,10 @@ function VarManager({ vars, onSaved, onClose, onDirtyChange }: {
   /** 固定底部操作栏的「保存修改」：用受控表单构建变量条目（去空白）。 */
   const submitEdit = () => {
     if (sel === null || saving || !editForm) return
+    if (!validateVarForm(editForm)) {
+      setBanner({ ok: false, text: '变量名必填；枚举变量需至少一个带「实际值」的选项' })
+      return
+    }
     const base = sel === 'new'
       ? { name: '', value: '', updatedAt: '' }
       : (drafts.find((d) => d.name.toLowerCase() === sel.toLowerCase()) ?? null)
@@ -902,8 +1016,13 @@ function VarManager({ vars, onSaved, onClose, onDirtyChange }: {
               {filterVars(drafts, varQuery).map((v) => (
                 <div key={v.name} className="p-manage-row">
                   <div className="p-manage-main">
-                    <span className="p-manage-name">{v.name}</span>
-                    {v.value ? (
+                    <span className="p-manage-name">
+                      {v.name}
+                      {isEnumVar(v) ? <span className="p-tag">枚举 {varOptions(v).length}</span> : null}
+                    </span>
+                    {isEnumVar(v) ? (
+                      <span className="p-manage-desc">{varOptions(v).slice(0, 3).map((o) => `${o.label} → ${o.value}`).join('；')}{varOptions(v).length > 3 ? ' …' : ''}</span>
+                    ) : v.value ? (
                       <span className="p-manage-desc">= {v.value}</span>
                     ) : null}
                   </div>
@@ -940,7 +1059,7 @@ function VarManager({ vars, onSaved, onClose, onDirtyChange }: {
               <button
                 type="button"
                 className="p-btn p-btn--sm p-btn--primary"
-                disabled={saving || !editForm?.name.trim() || !editForm?.value.trim()}
+                disabled={saving || !validateVarForm(editForm)}
                 onClick={submitEdit}
               >
                 保存修改
@@ -973,28 +1092,93 @@ function VarManager({ vars, onSaved, onClose, onDirtyChange }: {
   )
 }
 
-/** 单变量编辑表单（受控；「保存修改/取消」在管理弹窗固定底部操作栏）。 */
+/** 单变量编辑表单（受控；「保存修改/取消」在管理弹窗固定底部操作栏）。
+ *  取值方式二选一：单值（NAME=VALUE 主流形式）或枚举（显示名 + 实际值，可多选一）。 */
 function VarEditor({ form, onChange }: {
   form: VarForm | null
   onChange: (next: VarForm) => void
 }) {
   if (!form) return null
+  const enumMode = form.options.length > 0
+  const setOption = (index: number, patch: VarOption): void =>
+    onChange({ ...form, options: form.options.map((o, i) => (i === index ? patch : o)) })
   return (
     <>
       <label className="p-form-row">
-        <span className="p-form-label">变量名 *（如 项目 / 范围，不区分大小写）</span>
+        <span className="p-form-label">变量名 *（如 项目 / 环境信息，不区分大小写）</span>
         <input className="p-input" value={form.name} spellCheck={false} onChange={(e) => onChange({ ...form, name: e.target.value })} />
       </label>
-      <label className="p-form-row">
-        <span className="p-form-label">值 *（填充时点选此变量即插入该值）</span>
-        <input
-          className="p-input"
-          value={form.value}
-          placeholder="如 iobs_pro / 多租户缓存服务"
-          spellCheck={false}
-          onChange={(e) => onChange({ ...form, value: e.target.value })}
-        />
-      </label>
+
+      <div className="p-form-row">
+        <span className="p-form-label">取值方式</span>
+        <div className="p-row">
+          <button
+            type="button"
+            className={enumMode ? 'p-btn p-btn--sm' : 'p-btn p-btn--sm p-btn--on'}
+            onClick={() => onChange({ ...form, options: [] })}
+          >
+            单值
+          </button>
+          <button
+            type="button"
+            className={enumMode ? 'p-btn p-btn--sm p-btn--on' : 'p-btn p-btn--sm'}
+            onClick={() => onChange({ ...form, options: enumMode ? form.options : [{ label: '', value: '' }] })}
+          >
+            枚举（多选一）
+          </button>
+        </div>
+      </div>
+
+      {enumMode ? (
+        <>
+          {form.options.map((opt, index) => (
+            <div key={index} className="p-opt-row">
+              <input
+                className="p-input"
+                value={opt.label}
+                placeholder="显示名（如 测试环境1）"
+                spellCheck={false}
+                onChange={(e) => setOption(index, { ...opt, label: e.target.value })}
+              />
+              <input
+                className="p-input"
+                value={opt.value}
+                placeholder="实际值（如 https://t1.api）"
+                spellCheck={false}
+                onChange={(e) => setOption(index, { ...opt, value: e.target.value })}
+              />
+              <button
+                type="button"
+                className="p-btn p-btn--sm p-btn--danger"
+                title="删除该选项"
+                onClick={() => onChange({ ...form, options: form.options.filter((_, i) => i !== index) })}
+              >
+                <IconTrash size={13} />
+              </button>
+            </div>
+          ))}
+          <button
+            type="button"
+            className="p-btn p-btn--sm"
+            onClick={() => onChange({ ...form, options: [...form.options, { label: '', value: '' }] })}
+          >
+            <IconPlus size={12} />
+            <span>新增选项</span>
+          </button>
+          <div className="p-hint">枚举变量的「值」是一个集合：填充时下拉显示名、插入对应的实际值；显示名留空则用实际值显示。</div>
+        </>
+      ) : (
+        <label className="p-form-row">
+          <span className="p-form-label">值 *（填充时点选此变量即插入该值）</span>
+          <input
+            className="p-input"
+            value={form.value}
+            placeholder="如 iobs_pro / 多租户缓存服务"
+            spellCheck={false}
+            onChange={(e) => onChange({ ...form, value: e.target.value })}
+          />
+        </label>
+      )}
       <div className="p-hint">改一处全局生效：所有场景填充时都能选到这个变量。</div>
     </>
   )

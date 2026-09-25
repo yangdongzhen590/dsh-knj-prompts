@@ -38,15 +38,41 @@ export class SceneStore {
   }
 
   /**
-   * seed 合并与升级：
+   * seed 合并、升级与回收：
    * - 缺失的内置场景补入（带 seedPrompt 基线）；
    * - 用户未编辑过（prompt === seedPrompt）的内置场景随插件升级更新到新 seed；
    * - 用户编辑过（prompt !== seedPrompt）的内置场景不覆盖；
    * - 旧格式（无 seedPrompt 字段）按 EPOCH updatedAt 迁移：EPOCH = 从未经用户保存
-   *   编辑，其 prompt 即旧版 seed；非 EPOCH 无基线时保守不动。
+   *   编辑，其 prompt 即旧版 seed；非 EPOCH 无基线时保守不动；
+   * - 回收：不再出现在 SEED_SCENES 里的旧内置场景——用户未编辑过的直接移除
+   *   （插件升级后内置列表只保留新 seed），编辑过的降级为普通场景（builtin=false、
+   *   去掉 seed 基线），避免丢掉用户自己写的内容。
    */
   ensureSeeded(): void {
     let changed = false
+    const seedIds = new Set(SEED_SCENES.map((s) => s.id))
+
+    // ---- 回收：移除/降级不再属于 seed 的旧内置场景 ----
+    const retired: Scene[] = []
+    const kept: Scene[] = []
+    for (const s of this.scenes) {
+      if (!s.builtin || seedIds.has(s.id)) {
+        kept.push(s)
+        continue
+      }
+      // 是否被用户编辑过：有基线看 prompt 是否偏离；旧格式看 updatedAt 是否为 EPOCH
+      const edited = s.seedPrompt !== undefined
+        ? s.prompt !== s.seedPrompt
+        : s.updatedAt !== EPOCH
+      changed = true
+      if (edited) {
+        const { seedPrompt: _drop, ...rest } = s
+        retired.push({ ...rest, builtin: false })
+      }
+    }
+    if (retired.length) kept.push(...retired)
+    if (changed) this.scenes = kept
+
     for (const seed of SEED_SCENES) {
       const existing = this.scenes.find((s) => s.id === seed.id)
       if (!existing) {

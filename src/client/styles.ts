@@ -121,6 +121,23 @@ export const PROMPT_CSS = /* css */ `
 .knj-p .p-star:hover { background: var(--p-hover); color: var(--p-text); }
 .knj-p .p-star--on { color: var(--p-accent); fill: currentColor; }
 .knj-p .p-star--on:hover { color: var(--p-accent); }
+/* 变量枚举：选项编辑行 + 填充下拉 */
+.knj-p .p-opt-row { display: flex; align-items: center; gap: 6px; }
+.knj-p .p-opt-row .p-input { min-width: 0; }
+.knj-p .p-opt-row .p-btn { flex: none; }
+.knj-p .p-enum { display: flex; flex-direction: column; gap: 4px; }
+.knj-p .p-select { cursor: pointer; }
+/* 级联选择：第一级选变量、第二级选值 */
+.knj-p .p-combo-head {
+  display: flex; align-items: center; gap: 6px; width: 100%;
+  padding: 6px 8px; border: none; border-bottom: 1px solid var(--p-border-soft);
+  background: transparent; color: var(--p-text-2); cursor: pointer; text-align: left;
+}
+.knj-p .p-combo-head:hover { background: var(--p-hover); color: var(--p-text); }
+.knj-p .p-combo-head__back { color: var(--p-text-3); }
+.knj-p .p-combo-head__name { font-weight: 600; color: var(--p-text); }
+.knj-p .p-combo-head__hint { margin-left: auto; font-size: 11px; color: var(--p-text-3); }
+.knj-p .p-combo-empty { padding: 10px 8px; font-size: 11px; color: var(--p-text-3); text-align: center; }
 .knj-p .p-tag {
   font-size: 10px; line-height: 14px; padding: 0 5px; border-radius: 4px; flex: none;
   background: color-mix(in srgb, var(--p-accent) 14%, transparent); color: var(--p-accent);

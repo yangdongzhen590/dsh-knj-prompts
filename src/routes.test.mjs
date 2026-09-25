@@ -83,15 +83,17 @@ test('POST /api/knj-prompts/imports rejects cross-scheme origin before staging',
   s.server.close(); s.dispose(); rmSync(s.dir, { recursive: true, force: true })
 })
 
-test('GET /api/knj-prompts/scenes 返回 seed 场景', async () => {
+test('GET /api/knj-prompts/scenes 返回 seed 场景', async (t) => {
   const s = startServer()
+  t.after(() => { s.server.close(); s.dispose(); rmSync(s.dir, { recursive: true, force: true }) })
   await new Promise((r) => s.server.listen(0, '127.0.0.1', r))
   const port = s.server.address().port
   const res = await request(port, 'GET', '/api/knj-prompts/scenes')
   const data = JSON.parse(res.body)
   assert.equal(res.status, 200)
-  assert.equal(data.scenes.length, 6)
-  s.server.close(); s.dispose(); rmSync(s.dir, { recursive: true, force: true })
+  // 内置场景只保留「导出场景包」「安装场景包」两个
+  assert.equal(data.scenes.length, 2)
+  assert.deepEqual(data.scenes.map((x) => x.id).sort(), ['export-scene-package', 'install-scene-package'])
 })
 
 test('GET 响应带 Cache-Control: no-store（防浏览器缓存旧场景列表）', async () => {

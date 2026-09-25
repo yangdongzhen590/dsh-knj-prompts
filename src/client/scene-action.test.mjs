@@ -3,7 +3,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
-import { buildScenePackageExportDraft, resolveSceneAction, uniqueId, isPendingFillEligible, hasDirtyScenes, applyDraftEdit, applyDraftRemove, sortScenesForDisplay, paginate, PENDING_TTL_MS, PENDING_ARRIVAL_MS } from './engine.ts'
+import { buildScenePackageExportDraft, resolveSceneAction, uniqueId, isPendingFillEligible, hasDirtyScenes, hasDirtyVars, applyDraftEdit, applyDraftRemove, buildVarEdit, validateVar, sortScenesForDisplay, paginate, isEnumVar, varOptions, validateVarForm, varPickGroups, varPickOptions, PENDING_TTL_MS, PENDING_ARRIVAL_MS } from './engine.ts'
 
 test('sortScenesForDisplay 稳定地按 favorite、内置、其余分组', () => {
   const scenes = [
@@ -152,4 +152,109 @@ test('三个场景列表都按收藏排序 + 每页 10 条分页', async () => {
   assert.match(source, /新增场景/)
   // 收藏星标按钮共用的 aria-label 出现在管理行内（d.favorite 分支）
   assert.match(source, /aria-label=\{d\.favorite \? `取消收藏 \$\{d\.name\}` : `收藏 \$\{d\.name\}`\}/)
+})
+
+// ===== 变量库枚举选项 =====
+
+test('validateVar 支持枚举选项（label/value 成对、value 可空）', () => {
+  const options = [{ label: '测试环境1', value: 'https://t1.api' }, { label: '测试环境2', value: 'https://t2.api' }]
+  const ok = validateVar({ name: '环境信息', value: '', options, updatedAt: '' })
+  assert.equal(ok.name, '环境信息')
+  assert.equal(ok.value, '')
+  assert.deepEqual(ok.options, options, '选项顺序与内容必须保留')
+  // 空 label 回退为 value（显示名不丢）
+  assert.deepEqual(validateVar({ name: 'x', value: '', options: [{ label: '  ', value: 'v1' }] }).options, [{ label: 'v1', value: 'v1' }])
+  // 选项缺值 → 整条拒绝（不允许静默丢弃用户数据）
+  assert.equal(validateVar({ name: 'x', value: '', options: [{ label: 'a', value: ' ' }] }), null)
+  // options 为空数组 → 单值语义；单值空值仍拒绝
+  assert.equal(validateVar({ name: 'x', value: '' }), null)
+  assert.equal(validateVar({ name: 'x', value: '', options: [] }), null)
+  assert.equal(validateVar({ name: 'x', value: 'v', options: [] }).options, undefined)
+  assert.deepEqual(validateVar({ name: 'x', value: 'v' }), { name: 'x', value: 'v', updatedAt: '' })
+})
+
+test('isEnumVar / varOptions 判定与归一', () => {
+  assert.equal(isEnumVar({ name: 'a', value: '', options: [{ label: 'l', value: 'v' }], updatedAt: '' }), true)
+  assert.equal(isEnumVar({ name: 'a', value: 'v', updatedAt: '' }), false)
+  assert.equal(isEnumVar({ name: 'a', value: 'v', options: [], updatedAt: '' }), false)
+  assert.deepEqual(varOptions({ name: 'a', value: 'v', options: [{ label: '', value: 'v' }], updatedAt: '' }), [{ label: 'v', value: 'v' }])
+  assert.deepEqual(varOptions({ name: 'a', value: 'v', updatedAt: '' }), [])
+})
+
+test('hasDirtyVars 把选项变化视为脏', () => {
+  const base = [{ name: '环境信息', value: '', options: [{ label: '测试环境1', value: 't1' }], updatedAt: 't0' }]
+  assert.equal(hasDirtyVars(base, [{ ...base[0], options: [{ ...base[0].options[0] }] }]), false)
+  assert.equal(hasDirtyVars(base, [{ ...base[0], options: [{ label: '测试环境2', value: 't2' }] }]), true)
+  assert.equal(hasDirtyVars(base, [{ ...base[0], value: 'x' }]), true)
+})
+
+test('buildVarEdit 携带并归一选项', () => {
+  const built = buildVarEdit(
+    { name: '环境信息', value: '', updatedAt: 't0' },
+    { name: ' 环境信息 ', value: '', options: [{ label: ' 测试环境1 ', value: ' t1 ' }, { label: '', value: 't2' }] },
+  )
+  assert.equal(built.name, '环境信息')
+  assert.deepEqual(built.options, [{ label: '测试环境1', value: 't1' }, { label: 't2', value: 't2' }])
+  // 空选项数组 = 单值变量（不落空 options 字段）
+  assert.equal(buildVarEdit({ name: '项目', value: 'a', updatedAt: '' }, { name: '项目', value: ' b ', options: [] }).options, undefined)
+})
+
+test('validateVarForm 校验表单（枚举需至少一个带值选项）', () => {
+  assert.equal(validateVarForm({ name: '环境信息', value: '', options: [{ label: 'a', value: 't1' }] }), true)
+  assert.equal(validateVarForm({ name: '环境信息', value: '', options: [{ label: 'a', value: '' }] }), false)
+  assert.equal(validateVarForm({ name: '环境信息', value: '', options: [] }), false)
+  assert.equal(validateVarForm({ name: '项目', value: 'iobs_pro', options: [] }), true)
+  assert.equal(validateVarForm({ name: '', value: 'x', options: [] }), false)
+})
+
+test('变量管理器与填充面板暴露枚举控件', async () => {
+  const source = await readFile(new URL('./ScenePicker.tsx', import.meta.url), 'utf8')
+  // 管理器：枚举切换 + 选项编辑行
+  assert.match(source, /枚举/)
+  assert.match(source, /新增选项/)
+  assert.match(source, /p-opt-row/)
+  assert.match(source, /isEnumVar\(/)
+  // 填充面板：枚举变量走下拉 + 自定义输入 + 必选提示
+  assert.match(source, /EnumVarInput/)
+  assert.match(source, /自定义/)
+  assert.match(source, /必选/)
+  assert.match(source, /role="combobox"/)
+})
+
+test('varPickGroups 级联第一级：先选变量（枚举变量标注可选值数量）', () => {
+  const vars = [
+    { name: '环境信息', value: '', options: [{ label: '测试环境1', value: 'https://t1.api' }, { label: '测试环境2', value: 'https://t2.api' }], updatedAt: '' },
+    { name: '项目', value: 'iobs_pro', updatedAt: '' },
+    { name: '空变量', value: '', updatedAt: '' },
+  ]
+  const all = varPickGroups(vars, '')
+  assert.deepEqual(all.map((v) => v.name), ['环境信息', '项目'])
+  // 第一级按变量名过滤
+  assert.deepEqual(varPickGroups(vars, '项目').map((v) => v.name), ['项目'])
+  // 在第一级直接搜枚举显示名/实际值 → 仍能定位到所属变量（省一步）
+  assert.deepEqual(varPickGroups(vars, '测试环境2').map((v) => v.name), ['环境信息'])
+  assert.deepEqual(varPickGroups(vars, 't1.api').map((v) => v.name), ['环境信息'])
+  assert.deepEqual(varPickGroups(vars, '不存在的值'), [])
+  assert.deepEqual(varPickGroups(null, ''), [])
+})
+
+test('varPickOptions 级联第二级：再选该变量的具体值', () => {
+  const envVar = { name: '环境信息', value: '', options: [{ label: '测试环境1', value: 'https://t1.api' }, { label: '测试环境2', value: 'https://t2.api' }], updatedAt: '' }
+  const single = { name: '项目', value: 'iobs_pro', updatedAt: '' }
+  assert.deepEqual(varPickOptions(envVar, '').map((o) => o.label), ['测试环境1', '测试环境2'])
+  // 第二级按显示名/实际值过滤
+  assert.deepEqual(varPickOptions(envVar, '测试环境2').map((o) => o.value), ['https://t2.api'])
+  assert.deepEqual(varPickOptions(envVar, 't1.api').map((o) => o.value), ['https://t1.api'])
+  assert.deepEqual(varPickOptions(envVar, '不存在'), [])
+  // 单值变量没有第二级
+  assert.deepEqual(varPickOptions(single, ''), [])
+})
+
+test('填充面板实现级联选择（先变量后值）', async () => {
+  const source = await readFile(new URL('./ScenePicker.tsx', import.meta.url), 'utf8')
+  assert.match(source, /varPickGroups\(/)
+  assert.match(source, /varPickOptions\(/)
+  assert.match(source, /p-combo-head/)
+  assert.match(source, /个可选值/)
+  assert.doesNotMatch(source, /fillCandidates\(/)
 })
