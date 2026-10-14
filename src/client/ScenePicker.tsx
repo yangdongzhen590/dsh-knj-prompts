@@ -2,8 +2,9 @@
  * ScenePicker：输入框工具行右侧的「提示词」下拉（Task 4）。
  *
  * 流程：选场景 →（提示词含 {变量} 时先弹填充面板）→ 当前会话是空白会话
- * 则直接 setDraft 填充草稿；否则经 workspaces.startSession() 切到同工作区
- * 的空白会话，由新会话挂载的本组件消费 pendingFill 完成填充；微调即可发送。
+ * 则直接 setDraft 填充草稿；否则经宿主「新建会话」能力（engine.resolveSceneSessionStarter
+ * 逐级解析：uiWorkspace.startSession 优先，sessions.create+open 兜底）切到同工作区的
+ * 空白会话，由新会话挂载的本组件消费 pendingFill 完成填充；微调即可发送。
  * 宿主 API 结论见 PROBE.md。
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
@@ -14,6 +15,7 @@ import {
   applyDraftRemove,
   buildSceneEdit,
   buildVarEdit,
+  decideSceneFill,
   extractVariables,
   fillPrompt,
   filterScenes,
@@ -28,14 +30,14 @@ import {
   hasDuplicateVarNames,
   isPendingFillEligible,
   PENDING_TTL_MS,
-  resolveSceneAction,
+  readSessionIdentity,
   validateScene,
   validateVar,
   validateVarForm,
   isEnumVar,
   varOptions,
 } from './engine.ts'
-import type { SceneForm, VarForm } from './engine.ts'
+import type { SceneForm, SceneSessionStarter, SessionIdentity, SessionSnapshotLike, VarForm } from './engine.ts'
 import { IconChevronDown, IconClose, IconPlus, IconSparkles, IconStar, IconTrash } from './icons.tsx'
 import type { PromptVar, Scene, VarOption } from '../types.ts'
 
@@ -45,36 +47,53 @@ let pendingFill: PendingFill | undefined
 
 type PickerMode = 'menu' | 'fill' | 'export-select'
 
-/** 宿主注入本组件的最小结构面（标准套件 + InputZone owner share）。 */
+/** 宿主注入本组件的最小结构面（标准套件 + 可选的 InputZone owner share）。 */
 export interface ScenePickerProps {
-  /** InputZone owner share：会话快照（sessionId + blank=空日志）。 */
+  /**
+   * InputZone owner share 的会话快照（`conversation.input.dock` 才携带）。
+   * 在本插件实际注册的 `conversation.input.right` 上恒为 undefined，保留以便
+   * 宿主将来把 owner share 下放到工具行，或本组件迁移到 input.dock。
+   */
   session?: { sessionId?: string; blank?: boolean }
+  /**
+   * session 作用域**标准套件**的会话选择器（真实来源，见 engine.readSessionIdentity）。
+   * 与 inputActions 同源（ctx.uiSession.provide props:['inputActions']），在本插件
+   * 注册的 input.right 上确定可用；老宿主无此成员时整体降级为原地填充。
+   */
+  useSession?: <T>(selector: (snapshot: SessionSnapshotLike) => T) => T | undefined
   /** 标准套件：inputActions.setDraft 是唯一公开草稿写通道。 */
   inputActions?: { setDraft(text: string): void }
   /**
-   * 懒解析的 workspaces 服务（apply 传 getter，点击时再读——服务彼时必已挂载；
-   * 缺服务时返回 undefined，降级为原地填充，绝不阻塞 boot）。
+   * 已解析的「新建会话」能力（apply 传 getter，点击时再读——服务彼时必已挂载）。
+   * **由 engine.resolveSceneSessionStarter 逐级校验可调用性**后返回，所以这里拿到的
+   * 对象必然可调用；返回 undefined 时降级为原地填充，绝不阻塞 boot、也不抛异常。
    */
-  workspaces?: () => { startSession(workspaceId?: string): void } | undefined
+  sessionStarter?: () => SceneSessionStarter | undefined
 }
 
-/** 应用填充：决策见 engine.resolveSceneAction（空白→原地填；非空白→挂起并切新会话；无通道→兜底填当前）。 */
-function applySceneText(props: ScenePickerProps, text: string): void {
-  const sessionBlank = props.session?.blank
-  // 当前 DSH 运行时的 input.right 只提供标准 inputActions，未注入 InputZone owner share。
-  // 缺少会话身份/空白态时不能安全挂起跨会话填充，保守地直接写当前草稿。
-  if (sessionBlank === undefined) {
+/** 解析当前会话身份：owner share 优先，缺失时取 session 作用域标准套件（本宿主真实来源）。 */
+function resolveIdentity(props: ScenePickerProps): SessionIdentity | undefined {
+  return readSessionIdentity(props.session, props.useSession?.((snapshot) => snapshot))
+}
+
+/**
+ * 应用填充：去处决策见 engine.decideSceneFill
+ * （身份不可得/会话空白 → 原地填；非空白 + 能力可调用 → 挂起并切新会话）。
+ * identity 由组件在渲染期解析一次后传入，避免事件里再读 hook。
+ */
+function applySceneText(
+  props: ScenePickerProps,
+  identity: SessionIdentity | undefined,
+  text: string,
+): void {
+  const starter = props.sessionStarter?.()
+  const target = decideSceneFill(identity, starter !== undefined)
+  if (target === 'current-composer') {
     props.inputActions?.setDraft(text)
     return
   }
-  const workspaces = props.workspaces?.()
-  const action = resolveSceneAction(sessionBlank, workspaces !== undefined)
-  if (action === 'fill-here') {
-    props.inputActions?.setDraft(text)
-    return
-  }
-  pendingFill = { text, at: Date.now(), fromSessionId: props.session?.sessionId }
-  workspaces!.startSession()
+  pendingFill = { text, at: Date.now(), fromSessionId: identity?.sessionId }
+  starter!.start()
 }
 
 export function ScenePicker(props: ScenePickerProps) {
@@ -96,15 +115,19 @@ export function ScenePicker(props: ScenePickerProps) {
   const popRef = useRef<HTMLDivElement>(null)
   const packageInputRef = useRef<HTMLInputElement>(null)
 
+  // 当前会话身份：owner share 优先，缺失时取 session 作用域标准套件（真实来源）。
+  // useSession 是宿主注入的稳定 hook，无条件调用以保持 hook 调用顺序稳定。
+  const identity = resolveIdentity(props)
+
   // 消费挂起填充：新空白会话挂载/重渲染时落地（TTL 内 + 会话差量守卫；幂等）
   useEffect(() => {
     if (!pendingFill) return
     if (
       isPendingFillEligible(
-        props.session?.blank === true,
+        identity?.blank === true,
         Date.now() - pendingFill.at,
         pendingFill.fromSessionId,
-        props.session?.sessionId,
+        identity?.sessionId,
       ) &&
       props.inputActions
     ) {
@@ -181,7 +204,7 @@ export function ScenePicker(props: ScenePickerProps) {
       const { path } = await uploadScenePackage(file)
       const installer = scenes?.find((scene) => scene.id === 'install-scene-package')
       if (!installer) throw new Error('未找到“安装场景包”内置场景')
-      applySceneText(props, fillPrompt(installer.prompt, { 场景包ZIP路径: path }))
+      applySceneText(props, identity, fillPrompt(installer.prompt, { 场景包ZIP路径: path }))
       setOpen(false)
     } catch (error) {
       setPackageError(error instanceof Error ? `上传失败：${error.message}` : '上传失败，请重试')
@@ -202,7 +225,7 @@ export function ScenePicker(props: ScenePickerProps) {
     }
     const vars = extractVariables(s.prompt)
     if (vars.length === 0) {
-      applySceneText(props, s.prompt)
+      applySceneText(props, identity, s.prompt)
       setOpen(false)
       return
     }
@@ -213,14 +236,14 @@ export function ScenePicker(props: ScenePickerProps) {
 
   const confirmFill = () => {
     if (!fillScene) return
-    applySceneText(props, fillPrompt(fillScene.prompt, fillValues))
+    applySceneText(props, identity, fillPrompt(fillScene.prompt, fillValues))
     setOpen(false)
   }
 
   const exportScene = (scene: Scene) => {
     const exporter = scenes?.find((candidate) => candidate.id === 'export-scene-package')
     if (!exporter) return
-    applySceneText(props, buildScenePackageExportDraft(exporter.prompt, scene))
+    applySceneText(props, identity, buildScenePackageExportDraft(exporter.prompt, scene))
     setOpen(false)
   }
 
@@ -234,7 +257,7 @@ export function ScenePicker(props: ScenePickerProps) {
     }
   }
 
-  const inBlank = props.session?.blank === true
+  const inBlank = identity?.blank === true
 
   return (
     <div className="knj-p p-anchor">

@@ -3,7 +3,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
-import { buildScenePackageExportDraft, resolveSceneAction, uniqueId, isPendingFillEligible, hasDirtyScenes, hasDirtyVars, applyDraftEdit, applyDraftRemove, buildVarEdit, validateVar, sortScenesForDisplay, paginate, isEnumVar, varOptions, validateVarForm, varPickGroups, varPickOptions, PENDING_TTL_MS, PENDING_ARRIVAL_MS } from './engine.ts'
+import { buildScenePackageExportDraft, decideSceneFill, readSessionIdentity, resolveSceneSessionStarter, resolveSceneAction, uniqueId, isPendingFillEligible, hasDirtyScenes, hasDirtyVars, applyDraftEdit, applyDraftRemove, buildVarEdit, validateVar, sortScenesForDisplay, paginate, isEnumVar, varOptions, validateVarForm, varPickGroups, varPickOptions, PENDING_TTL_MS, PENDING_ARRIVAL_MS } from './engine.ts'
 
 test('sortScenesForDisplay 稳定地按 favorite、内置、其余分组', () => {
   const scenes = [
@@ -31,10 +31,115 @@ test('paginate 默认每页十条并钳制页码', () => {
   assert.equal(paginate(items, 0).page, 1)
 })
 
-test('ScenePicker 在当前宿主未注入 InputZone owner share 时原地填入草稿', async () => {
+/**
+ * 回归：0.1.2-rc.1 宿主的 `conversation.input.right` 由 InputBar 以
+ * `renderSlot("conversation.input.right", {})` 渲染，其插槽声明无 owner，InputZone
+ * owner share 永远不达该位置 —— 因此 `props.session` 恒为 undefined。
+ * 曾经据此写下的「缺 owner share 就地填入草稿」兜底，使「新会话并填充」退化为
+ * 填充当前会话（缺陷本体）。会话身份必须取自 session 作用域标准套件 useSession
+ * （与已生效的 inputActions 同源：ctx.uiSession.provide props:['inputActions']）。
+ */
+test('readSessionIdentity 以 owner share 优先、标准套件兜底，身份不全则拒绝', () => {
+  // 标准套件通道（本宿主真实来源）：owner share 缺失也拿到身份
+  assert.deepEqual(readSessionIdentity(undefined, { sessionId: 's1', blank: false }), { sessionId: 's1', blank: false })
+  assert.deepEqual(readSessionIdentity(undefined, { sessionId: 's2', blank: true }), { sessionId: 's2', blank: true })
+  // owner share 优先（将来宿主下放到工具行时以它为准）
+  assert.deepEqual(
+    readSessionIdentity({ sessionId: 'owner', blank: false }, { sessionId: 'std', blank: true }),
+    { sessionId: 'owner', blank: false })
+  // 两条通道都缺 → 身份不可得（调用方保守原地填充，绝不误开新会话）
+  assert.equal(readSessionIdentity(undefined, undefined), undefined)
+  // blank 非布尔（未定型快照）→ 不采信，不半拼合身份
+  assert.equal(readSessionIdentity(undefined, { sessionId: 's3' }), undefined)
+  assert.equal(readSessionIdentity({ sessionId: 's4', blank: undefined }, undefined), undefined)
+})
+
+test('decideSceneFill：非空白且有新建通道才开新会话', () => {
+  // 本插件主用例：非空白 + 有 workspaces → 新会话再填充（修复前这里恒为 current-composer）
+  assert.equal(decideSceneFill({ sessionId: 's1', blank: false }, true), 'new-session')
+  // 空白会话：原地填充（New Session 会复用它，另开只会白留一个空壳）
+  assert.equal(decideSceneFill({ sessionId: 's1', blank: true }, true), 'current-composer')
+  // 非空白但宿主无 workspaces：兜底原地填充，不白选一场
+  assert.equal(decideSceneFill({ sessionId: 's1', blank: false }, false), 'current-composer')
+  // 身份不可得：绝不猜，保守原地填充
+  assert.equal(decideSceneFill(undefined, true), 'current-composer')
+  assert.equal(decideSceneFill(undefined, false), 'current-composer')
+})
+
+test('resolveSceneSessionStarter 按可调用性逐级解析，绝不返回不可调用的能力', () => {
+  const fake = (services) => ({ get: (name) => services[name] })
+
+  // 本机实测形态（回归）：`workspaces` 是 Workspace 控制器，**没有** startSession。
+  // 曾经只判「服务存在」就让调用点 startSession() → TypeError（用户看到「选场景就报错」）。
+  const workspacesOnly = fake({ workspaces: { list: {}, create: () => {}, rename: () => {} } })
+  assert.equal(resolveSceneSessionStarter(workspacesOnly), undefined,
+    'Workspace 控制器不得被当成新建会话能力（它压根没有会话方法）')
+  // 缺失 / 无 ctx / get 抛错 → undefined，不得抛异常
+  assert.equal(resolveSceneSessionStarter(fake({})), undefined)
+  assert.equal(resolveSceneSessionStarter(undefined), undefined)
+  assert.equal(resolveSceneSessionStarter({ get: () => { throw new Error('boom') } }), undefined)
+
+  // 首选 uiWorkspace.startSession：转发参数并保留 this
+  const calls = []
+  const uiWorkspace = {
+    startSession(workspaceId) { calls.push({ self: this, workspaceId }); return undefined },
+  }
+  const starter = resolveSceneSessionStarter(fake({ uiWorkspace }))
+  assert.ok(starter, 'uiWorkspace.startSession 可调用时应解析成功')
+  starter.start()
+  assert.deepEqual(calls, [{ self: uiWorkspace, workspaceId: undefined }], 'start 必须带 this 调用实例方法')
+  starter.start('ws-1')
+  assert.equal(calls[1].workspaceId, 'ws-1')
+
+  // uiWorkspace 存在但 startSession 不是函数 → 落到兜底，而不是返回坏能力
+  const withBadUi = fake({ uiWorkspace: { startSession: 'nope' }, sessions: { create: async () => 's-new', open: () => {} } })
+  assert.ok(resolveSceneSessionStarter(withBadUi), 'startSession 非法时应继续尝试兜底通道')
+
+  // 兜底 sessions.create + open：create 解析出身份后再 open 导航
+  const opened = []
+  const sessionsStarter = resolveSceneSessionStarter(fake({
+    sessions: { create: async () => 's-new', open: (id) => opened.push(id) },
+  }))
+  assert.ok(sessionsStarter, 'sessions.create+open 可调用时应解析成功')
+  sessionsStarter.start()
+  return Promise.resolve().then(() => {
+    assert.deepEqual(opened, ['s-new'], 'create 成功后必须 open 新会话')
+  })
+})
+
+test('resolveSceneSessionStarter 兜底通道：create 失败或被拒时静默不导航', async () => {
+  const fake = (services) => ({ get: (name) => services[name] })
+  const opened = []
+  // create 拒绝 → 不 open、不抛
+  const rejected = resolveSceneSessionStarter(fake({
+    sessions: { create: () => Promise.reject(new Error('host down')), open: (id) => opened.push(id) },
+  }))
+  rejected.start()
+  // create 返回非身份值 → 不 open
+  const empty = resolveSceneSessionStarter(fake({
+    sessions: { create: async () => undefined, open: (id) => opened.push(id) },
+  }))
+  empty.start()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.deepEqual(opened, [], '未能取得会话身份时不得导航（宁可不跳，也不跳错）')
+})
+
+test('ScenePicker 从标准套件 useSession 取会话身份，不再依赖 owner share', async () => {
   const source = await readFile(new URL('./ScenePicker.tsx', import.meta.url), 'utf8')
-  assert.match(source, /const sessionBlank = props\.session\?\.blank/)
-  assert.match(source, /if \(sessionBlank === undefined\) \{\s*props\.inputActions\?\.setDraft\(text\)\s*return\s*\}/s)
+  // 身份解析走 readSessionIdentity（owner share 优先 + useSession 兜底）
+  assert.match(source, /const identity = resolveIdentity\(props\)/)
+  assert.match(source, /readSessionIdentity\(props\.session, props\.useSession\?\.\(\(snapshot\) => snapshot\)\)/)
+  // 填充去处一律经 decideSceneFill 与已校验的能力，禁止复原旧兜底分支
+  assert.match(source, /const target = decideSceneFill\(identity, starter !== undefined\)/)
+  assert.match(source, /const starter = props\.sessionStarter\?\.\(\)/)
+  assert.match(source, /starter!\.start\(\)/)
+  assert.doesNotMatch(source, /sessionBlank/, '不得恢复已删除的 sessionBlank 兜底分支')
+  assert.doesNotMatch(source, /workspaces/, '不得再直接读 workspaces 服务（它没有会话方法）')
+  // 所有 applySceneText 调用点都必须带上 identity（否则会退回「身份不可得」）
+  // 声明处是 `identity: SessionIdentity | undefined,`（冒号），调用点是 `identity,`
+  const calls = [...source.matchAll(/applySceneText\(([^)]*?\bidentity,)/g)].map((m) => m[1])
+  assert.ok(calls.length >= 4, `应至少 4 个调用点，实际 ${calls.length}`)
+  for (const args of calls) assert.match(args, /^props, identity,$/, `调用点缺少 identity：${args}`)
 })
 
 test('ScenePicker 的导出选择仅列出普通场景，点击后将选中场景内容交给 exporter', async () => {

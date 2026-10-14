@@ -72,10 +72,147 @@ export function buildScenePackageExportDraft(exporterPrompt: string, scene: Scen
 export type SceneAction = 'fill-here' | 'start-new'
 
 /**
- * 决策表（Task 4 规格）：
+ * 宿主会话身份的最小子集（决定「原地填充」还是「开新会话再填充」）。
+ * 只含决策真正需要的两项，避免把整个宿主快照类型拖进客户端组件。
+ */
+export interface SessionSnapshotLike {
+  readonly sessionId?: string
+  /** 空日志位：该会话还没被任何已接受的首条 prompt 消费。 */
+  readonly blank?: boolean
+}
+
+/**
+ * 当前会话身份。身份不可得时整体为 undefined——**不得**用一半来源拼合：
+ * 判定「开新会话」要求 blank 与 sessionId 都可信，否则宁可不判定。
+ */
+export interface SessionIdentity {
+  readonly sessionId?: string
+  readonly blank: boolean
+}
+
+/**
+ * 从宿主给的两条通道解析当前会话身份：
+ * - owner share（`conversation.input.dock` 的 InputZone）直接给 `session`；
+ * - session 作用域**标准套件**给 `useSession`（`@deepseek-ai/dsh-client-ui-session`
+ *   的 SessionStandardProps，与已在本插件生效的 `inputActions` 同源）。
+ *
+ * 实测 0.1.2-rc.1：`conversation.input.right` 由 InputBar 以 `renderSlot(name, {})`
+ * 渲染，且其插槽声明**无 owner**，因此 owner share 永远不达 input.right；
+ * 标准套件才是该位置唯一可用的会话身份来源。
+ * 任一来源给出会话身份即采纳；两者皆无 → undefined（调用方保守原地填充）。
+ */
+export function readSessionIdentity(
+  ownerSession: SessionSnapshotLike | undefined,
+  standardSession: SessionSnapshotLike | undefined,
+): SessionIdentity | undefined {
+  const snapshot = ownerSession ?? standardSession
+  if (snapshot === undefined || typeof snapshot.blank !== 'boolean') return undefined
+  return { sessionId: snapshot.sessionId, blank: snapshot.blank }
+}
+
+/** 场景填充去处（与 SceneAction 区分：这里只回答「草稿写哪儿」）。 */
+export type SceneFillTarget = 'current-composer' | 'new-session'
+
+/**
+ * 新建会话能力（已解析、必然可调用）。
+ * - `uiWorkspace`：跨 Controller 的工作区导航能力，`startSession(workspaceId?)`
+ *   复用同工作区的空白会话（没有则新建）并导航过去 —— 与宿主「新建会话」同一条路径。
+ * - `sessions`：底层原语 `create()` + `open()`，在没有 uiWorkspace 的宿主上兜底。
+ */
+export interface SceneSessionStarter {
+  /** 开新会话并导航过去。workspaceId 省略时由宿主继承当前/最近工作区。 */
+  start(workspaceId?: string): void
+}
+
+/** `ctx.get(name)` 的最小结构面（cordis 服务解析）；宿主可能根本没有 get，故可选。 */
+export interface ServiceResolver {
+  get?(name: string): unknown
+}
+
+function isCallable(value: unknown): value is (...args: never[]) => unknown {
+  return typeof value === 'function'
+}
+
+/**
+ * 解析「新建会话」能力，**按可调用性逐级校验**：
+ * 1. `uiWorkspace`（首选）：`startSession` 是官方 New Session 路径（复用空白会话 + 导航）；
+ * 2. `sessions`（兜底）：`create()` 建会话、`open()` 导航。
+ *
+ * 必须做方法级校验，而不是「服务存在即算有通道」：本机实测 `ctx.get('workspaces')`
+ * 返回的是 **Workspace 控制器**（`IWorkspaces` 只有 list/create/rename/delete/insert
+ * 系列，压根没有会话方法），只判 `!== undefined` 会让调用点直接抛
+ * `workspaces.startSession is not a function` —— 用户侧表现为「选场景就报错」。
+ * 两者都不可调用时返回 undefined，由 decideSceneFill 降级为原地填充（不白选一场场景）。
+ */
+export function resolveSceneSessionStarter(
+  ctx: ServiceResolver | undefined,
+): SceneSessionStarter | undefined {
+  const lookup = (name: string): unknown => {
+    const get = ctx?.get
+    if (typeof get !== 'function') return undefined
+    try {
+      return get.call(ctx, name)
+    } catch {
+      return undefined
+    }
+  }
+
+  // 首选：uiWorkspace.startSession（官方 New Session 路径）
+  const uiWorkspace = lookup('uiWorkspace') as { startSession?: unknown } | undefined
+  if (uiWorkspace !== undefined && isCallable(uiWorkspace.startSession)) {
+    const startSession = uiWorkspace.startSession as (workspaceId?: string) => unknown
+    return {
+      start: (workspaceId?: string) => {
+        // 与宿主 UI 同款调用约定：startSession 挂在服务实例上，需保留 this
+        startSession.call(uiWorkspace, workspaceId)
+      },
+    }
+  }
+
+  // 兜底：sessions.create + sessions.open（底层原语，暴露为 ctx.sessions）
+  const sessions = lookup('sessions') as { create?: unknown; open?: unknown } | undefined
+  if (sessions !== undefined && isCallable(sessions.create) && isCallable(sessions.open)) {
+    const create = sessions.create as (opts?: { workspaceId?: string }) => Promise<unknown>
+    const open = sessions.open as (id: string) => unknown
+    return {
+      start: () => {
+        // create() 返回 Promise<SessionId>；身份可用后再 open 导航。
+        // 静默失败是刻意的：宿主未就绪时宁可不导航，也不向用户抛异常。
+        void create.call(sessions).then(
+          (sessionId) => {
+            if (typeof sessionId === 'string' && sessionId !== '') open.call(sessions, sessionId)
+          },
+          () => {},
+        )
+      },
+    }
+  }
+
+  return undefined
+}
+
+/**
+ * 场景填充决策（纯函数，可测）：
+ * - 会话身份不可得（宿主未注入任何通道）→ 原地填充：不能安全挂起跨会话填充，
+ *   保守地写当前草稿，绝不静默丢弃用户选中的场景；
+ * - 会话空白 → 原地填充（空白会话会被 New Session 复用，另开一个只会白留一个是空壳）；
+ * - 会话非空白且新建会话能力**可调用** → 开新会话再填充（本插件的主用例）。
+ */
+export function decideSceneFill(
+  identity: SessionIdentity | undefined,
+  hasStartSession: boolean,
+): SceneFillTarget {
+  if (identity === undefined) return 'current-composer'
+  return resolveSceneAction(identity.blank, hasStartSession) === 'start-new'
+    ? 'new-session'
+    : 'current-composer'
+}
+
+/**
+ * 决策表（Task 4 规格，`hasWorkspaces` 语义已更正为「新建会话能力可调用」）：
  * - 空白会话 → 原地填充（fill-here），无论通道是否存在；
- * - 非空白 + 有 workspaces → 挂起填充并 startSession() 切同工作区新空白会话（start-new）；
- * - 非空白 + 无 workspaces → 兜底填当前会话（fill-here），用户可直接发送。
+ * - 非空白 + 能力可用 → 挂起填充并切同工作区新空白会话（start-new）；
+ * - 非空白 + 能力不可用 → 兜底填当前会话（fill-here），用户可直接发送。
  */
 export function resolveSceneAction(sessionBlank: boolean, hasWorkspaces: boolean): SceneAction {
   if (sessionBlank) return 'fill-here'
