@@ -3,7 +3,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
-import { buildScenePackageExportDraft, decideSceneFill, readSessionIdentity, resolveSceneSessionStarter, resolveSceneAction, uniqueId, isPendingFillEligible, hasDirtyScenes, hasDirtyVars, applyDraftEdit, applyDraftRemove, buildVarEdit, validateVar, sortScenesForDisplay, paginate, isEnumVar, varOptions, validateVarForm, varPickGroups, varPickOptions, PENDING_TTL_MS, PENDING_ARRIVAL_MS } from './engine.ts'
+import { buildScenePackageExportDraft, decideSceneFill, readSessionIdentity, resolveSceneSessionStarter, resolveSceneAction, uniqueId, hasDirtyScenes, hasDirtyVars, applyDraftEdit, applyDraftRemove, buildVarEdit, validateVar, sortScenesForDisplay, paginate, isEnumVar, varOptions, validateVarForm, varPickGroups, varPickOptions } from './engine.ts'
+import * as engine from './engine.ts'
 
 test('sortScenesForDisplay 稳定地按 favorite、内置、其余分组', () => {
   const scenes = [
@@ -66,7 +67,7 @@ test('decideSceneFill：非空白且有新建通道才开新会话', () => {
   assert.equal(decideSceneFill(undefined, false), 'current-composer')
 })
 
-test('resolveSceneSessionStarter 按可调用性逐级解析，绝不返回不可调用的能力', () => {
+test('resolveSceneSessionStarter 只认 uiWorkspace.startSession，并按原生草稿参数调用', () => {
   const fake = (services) => ({ get: (name) => services[name] })
 
   // 本机实测形态（回归）：`workspaces` 是 Workspace 控制器，**没有** startSession。
@@ -79,49 +80,37 @@ test('resolveSceneSessionStarter 按可调用性逐级解析，绝不返回不�
   assert.equal(resolveSceneSessionStarter(undefined), undefined)
   assert.equal(resolveSceneSessionStarter({ get: () => { throw new Error('boom') } }), undefined)
 
-  // 首选 uiWorkspace.startSession：转发参数并保留 this
+  // 唯一通道：startSession 转发 (workspaceId, { prompt, clearPreviousDraft }) 并保留 this
   const calls = []
   const uiWorkspace = {
-    startSession(workspaceId) { calls.push({ self: this, workspaceId }); return undefined },
+    startSession(workspaceId, options) { calls.push({ self: this, workspaceId, options }); return undefined },
   }
   const starter = resolveSceneSessionStarter(fake({ uiWorkspace }))
   assert.ok(starter, 'uiWorkspace.startSession 可调用时应解析成功')
-  starter.start()
-  assert.deepEqual(calls, [{ self: uiWorkspace, workspaceId: undefined }], 'start 必须带 this 调用实例方法')
-  starter.start('ws-1')
-  assert.equal(calls[1].workspaceId, 'ws-1')
-
-  // uiWorkspace 存在但 startSession 不是函数 → 落到兜底，而不是返回坏能力
-  const withBadUi = fake({ uiWorkspace: { startSession: 'nope' }, sessions: { create: async () => 's-new', open: () => {} } })
-  assert.ok(resolveSceneSessionStarter(withBadUi), 'startSession 非法时应继续尝试兜底通道')
-
-  // 兜底 sessions.create + open：create 解析出身份后再 open 导航
-  const opened = []
-  const sessionsStarter = resolveSceneSessionStarter(fake({
-    sessions: { create: async () => 's-new', open: (id) => opened.push(id) },
-  }))
-  assert.ok(sessionsStarter, 'sessions.create+open 可调用时应解析成功')
-  sessionsStarter.start()
-  return Promise.resolve().then(() => {
-    assert.deepEqual(opened, ['s-new'], 'create 成功后必须 open 新会话')
-  })
+  starter.start('场景文本')
+  assert.deepEqual(calls, [{ self: uiWorkspace, workspaceId: undefined,
+    options: { prompt: '场景文本', clearPreviousDraft: true } }],
+  '必须一次调用把草稿交给宿主（0.2.1 的 DraftInitializationOptions），且显式覆盖旧草稿')
+  starter.start('另一段', 'ws-1')
+  assert.deepEqual(calls[1], { self: uiWorkspace, workspaceId: 'ws-1',
+    options: { prompt: '另一段', clearPreviousDraft: true } })
 })
 
-test('resolveSceneSessionStarter 兜底通道：create 失败或被拒时静默不导航', async () => {
+test('resolveSceneSessionStarter 不再伪造兜底通道（sessions.open 已从宿主接口移除）', () => {
   const fake = (services) => ({ get: (name) => services[name] })
-  const opened = []
-  // create 拒绝 → 不 open、不抛
-  const rejected = resolveSceneSessionStarter(fake({
-    sessions: { create: () => Promise.reject(new Error('host down')), open: (id) => opened.push(id) },
-  }))
-  rejected.start()
-  // create 返回非身份值 → 不 open
-  const empty = resolveSceneSessionStarter(fake({
-    sessions: { create: async () => undefined, open: (id) => opened.push(id) },
-  }))
-  empty.start()
-  await new Promise((resolve) => setTimeout(resolve, 0))
-  assert.deepEqual(opened, [], '未能取得会话身份时不得导航（宁可不跳，也不跳错）')
+  // 旧兜底 sessions.create + open：0.2.1-rc.2 的 ISessions 已无 open，导航归属 uiWorkspace
+  assert.equal(resolveSceneSessionStarter(fake({
+    sessions: { create: async () => 's-new', open: () => {} },
+  })), undefined, 'sessions 不得再被当成新建会话通道（open 已不存在，那只是假安全网）')
+  // startSession 非函数 → 直接降级，不转投别的服务
+  assert.equal(resolveSceneSessionStarter(fake({
+    uiWorkspace: { startSession: 'nope' },
+    sessions: { create: async () => 's-new', open: () => {} },
+  })), undefined)
+  // 模块面不再导出跨挂载补丁 API（删掉的常量/函数不得被重新引入）
+  assert.equal('isPendingFillEligible' in engine, false, '挂起填充资格判定应已随通道一起删除')
+  assert.equal('PENDING_TTL_MS' in engine, false)
+  assert.equal('PENDING_ARRIVAL_MS' in engine, false)
 })
 
 test('ScenePicker 从标准套件 useSession 取会话身份，不再依赖 owner share', async () => {
@@ -132,7 +121,9 @@ test('ScenePicker 从标准套件 useSession 取会话身份，不再依赖 owne
   // 填充去处一律经 decideSceneFill 与已校验的能力，禁止复原旧兜底分支
   assert.match(source, /const target = decideSceneFill\(identity, starter !== undefined\)/)
   assert.match(source, /const starter = props\.sessionStarter\?\.\(\)/)
-  assert.match(source, /starter!\.start\(\)/)
+  assert.match(source, /starter\.start\(text\)/, '新会话填充必须一次调用把文本交给宿主（原生草稿注入）')
+  assert.doesNotMatch(source, /pendingFill/i, '不得恢复跨挂载挂起填充通道')
+  assert.doesNotMatch(source, /PENDING_/, '不得恢复 TTL/到达窗口常量')
   assert.doesNotMatch(source, /sessionBlank/, '不得恢复已删除的 sessionBlank 兜底分支')
   assert.doesNotMatch(source, /workspaces/, '不得再直接读 workspaces 服务（它没有会话方法）')
   // 所有 applySceneText 调用点都必须带上 identity（否则会退回「身份不可得」）
@@ -174,23 +165,17 @@ test('uniqueId 去重与净化', () => {
   assert.match(uniqueId('---', []), /^scene-[a-z0-9]+$/)
 })
 
-test('isPendingFillEligible 挂起填充资格（到达窗口 + TTL + 会话差量守卫）', () => {
-  const ttl = PENDING_TTL_MS
-  const arrival = PENDING_ARRIVAL_MS
-  // 到达窗口内 + 会话切换（mountId ≠ fromId）+ 空白 → 可消费
-  assert.equal(isPendingFillEligible(true, arrival - 1, 's1', 's2'), true)
-  // 超过到达窗口（即使仍在 TTL 内）→ 不可消费：
-  // startSession 的导航是亚秒级的，迟迟未到的挂载多半是用户手动切到别的空白会话，不得误填
-  assert.equal(isPendingFillEligible(true, arrival + 1, 's1', 's2'), false,
-    '到达窗口外不得消费（防手动切换误填）')
-  assert.equal(isPendingFillEligible(true, ttl + 1, 's1', 's2'), false)
-  // 非空白 → 不可消费
-  assert.equal(isPendingFillEligible(false, 100, 's1', 's2'), false)
-  // 同一会话重挂载（mountId === fromId）→ 不可消费（不是新会话）
-  assert.equal(isPendingFillEligible(true, 100, 's1', 's1'), false)
-  // 无会话身份（fromId 缺失）→ 保守不允许
-  assert.equal(isPendingFillEligible(true, 100, undefined, 's2'), false)
-  assert.equal(isPendingFillEligible(true, 100, 's1', undefined), false)
+test('填充去处与可用通道一致：没有可调用通道时绝不判定 new-session', () => {
+  const fake = (services) => ({ get: (name) => services[name] })
+  const noChannel = resolveSceneSessionStarter(fake({}))
+  const withChannel = resolveSceneSessionStarter(fake({ uiWorkspace: { startSession() {} } }))
+  assert.equal(noChannel, undefined)
+  assert.ok(withChannel)
+  // 非空白会话：有能力才新开会话，没能力一律原地填（不白选一场场景）
+  assert.equal(decideSceneFill({ sessionId: 's1', blank: false }, noChannel !== undefined), 'current-composer')
+  assert.equal(decideSceneFill({ sessionId: 's1', blank: false }, withChannel !== undefined), 'new-session')
+  // 空白会话不受通道影响：一律原地填（新开会话只会被宿主复用成空壳）
+  assert.equal(decideSceneFill({ sessionId: 's1', blank: true }, withChannel !== undefined), 'current-composer')
 })
 
 test('hasDirtyScenes 管理弹窗脏检查（关闭丢弃守卫用）', () => {

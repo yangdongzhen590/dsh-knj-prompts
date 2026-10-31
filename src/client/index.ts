@@ -10,7 +10,7 @@ import { resolveSceneSessionStarter, type SceneSessionStarter } from './engine.t
 
 export const name = 'dsh-knj-prompts'
 
-/** ctx.slots 的最小结构面（宿主 dsh-client-runtime 提供 SlotRegistry）。 */
+/** ctx.slots 的最小结构面（宿主 SlotRegistry；0.2.1 起并进前端静态模块表）。 */
 interface SlotsLike {
   register(opts: {
     name: string
@@ -34,9 +34,13 @@ interface ClientContext {
 
 /**
  * 客户端插件在 cordis 里等待的服务（真实服务名，见 PROBE.md）：
- * - slots —— 由 @deepseek-ai/dsh-client-runtime 提供（SlotRegistry）。
- * - sessions —— 仅用于兜底的「新建会话」原语（create/open）。**只作为软依赖**：
- *   用懒 getter 在交互时解析，宿主缺该服务也不会让 fiber 永久 pending 阻塞 boot。
+ * - slots —— 由 @deepseek-ai/dsh-client-ui-slots 提供（SlotRegistry；0.2.1 起并进
+ *   `dsh-web-frontend` 静态模块表，不再是独立 npm 包）。
+ * - uiWorkspace —— 「新建会话 + 原生草稿注入」通道（`startSession(workspaceId?,
+ *   { prompt, clearPreviousDraft })`）。**只作为软依赖**：用懒 getter 在交互时解析，
+ *   宿主缺该服务也不会让 fiber 永久 pending 阻塞 boot。
+ *   （旧版 `sessions.create() + open()` 兜底已删除：0.2.1-rc.2 的 `ISessions` 不再
+ *   暴露 `open`，那段代码永远不命中，详见 engine.resolveSceneSessionStarter。）
  * 会话/输入能力（useSession / inputActions 等 session 作用域标准套件）经插槽注入
  * 组件本身，无需在此 inject。注意：**不要**依赖 InputZone owner share 的 `session`
  * ——`conversation.input.right` 的插槽声明无 owner，宿主以 renderSlot(name, {}) 渲染它，

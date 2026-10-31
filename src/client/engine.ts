@@ -114,14 +114,21 @@ export function readSessionIdentity(
 export type SceneFillTarget = 'current-composer' | 'new-session'
 
 /**
- * 新建会话能力（已解析、必然可调用）。
- * - `uiWorkspace`：跨 Controller 的工作区导航能力，`startSession(workspaceId?)`
- *   复用同工作区的空白会话（没有则新建）并导航过去 —— 与宿主「新建会话」同一条路径。
- * - `sessions`：底层原语 `create()` + `open()`，在没有 uiWorkspace 的宿主上兜底。
+ * 新建会话能力（已解析、必然可调用）。只有一条通道：`uiWorkspace.startSession`
+ * —— 与宿主「新建会话」同一条路径（复用同工作区的空白会话，没有则新建，并导航过去）。
+ *
+ * 0.2.1-rc.2 起 `startSession` 接受 `{ prompt, clearPreviousDraft }`：宿主在
+ * `openWorkspace` 的 `beforeOpen` 里、**导航发布之前**按会话身份把草稿写进目标会话
+ * （`conversation.input.requestDraftInitialization`）。所以「开新会话并填充」是一次
+ * 调用，不再需要「先跳转、再等新会话挂载补填」的跨挂载通道。
  */
 export interface SceneSessionStarter {
-  /** 开新会话并导航过去。workspaceId 省略时由宿主继承当前/最近工作区。 */
-  start(workspaceId?: string): void
+  /**
+   * 开新会话并把草稿一起交给宿主。
+   * @param prompt - 写进目标会话草稿的完整文本。
+   * @param workspaceId - 目标工作区；省略时由宿主继承当前/最近工作区。
+   */
+  start(prompt: string, workspaceId?: string): void
 }
 
 /** `ctx.get(name)` 的最小结构面（cordis 服务解析）；宿主可能根本没有 get，故可选。 */
@@ -134,15 +141,17 @@ function isCallable(value: unknown): value is (...args: never[]) => unknown {
 }
 
 /**
- * 解析「新建会话」能力，**按可调用性逐级校验**：
- * 1. `uiWorkspace`（首选）：`startSession` 是官方 New Session 路径（复用空白会话 + 导航）；
- * 2. `sessions`（兜底）：`create()` 建会话、`open()` 导航。
+ * 解析「新建会话」能力：**只认 `uiWorkspace.startSession`，且必须方法级可调用**。
  *
- * 必须做方法级校验，而不是「服务存在即算有通道」：本机实测 `ctx.get('workspaces')`
- * 返回的是 **Workspace 控制器**（`IWorkspaces` 只有 list/create/rename/delete/insert
- * 系列，压根没有会话方法），只判 `!== undefined` 会让调用点直接抛
+ * 为什么不「服务存在即算有通道」：本机实测 `ctx.get('workspaces')` 返回的是
+ * **Workspace 控制器**（`IWorkspaces` 只有 list/create/rename/delete/insert 系列，
+ * 压根没有会话方法），只判 `!== undefined` 会让调用点直接抛
  * `workspaces.startSession is not a function` —— 用户侧表现为「选场景就报错」。
- * 两者都不可调用时返回 undefined，由 decideSceneFill 降级为原地填充（不白选一场场景）。
+ * 不可调用时返回 undefined，由 decideSceneFill 降级为原地填充（不白选一场场景）。
+ *
+ * 旧的 `sessions.create() + open()` 兜底已删除：0.2.1-rc.2 的 `ISessions` 不再暴露
+ * `open`（导航归属 `uiWorkspace.openSession`），那段代码在新宿主上永远不命中，
+ * 只是假安全网；继续留着会让「降级为原地填充」看起来像有后备通道。
  */
 export function resolveSceneSessionStarter(
   ctx: ServiceResolver | undefined,
@@ -157,38 +166,24 @@ export function resolveSceneSessionStarter(
     }
   }
 
-  // 首选：uiWorkspace.startSession（官方 New Session 路径）
   const uiWorkspace = lookup('uiWorkspace') as { startSession?: unknown } | undefined
-  if (uiWorkspace !== undefined && isCallable(uiWorkspace.startSession)) {
-    const startSession = uiWorkspace.startSession as (workspaceId?: string) => unknown
-    return {
-      start: (workspaceId?: string) => {
-        // 与宿主 UI 同款调用约定：startSession 挂在服务实例上，需保留 this
-        startSession.call(uiWorkspace, workspaceId)
-      },
-    }
-  }
+  if (uiWorkspace === undefined || !isCallable(uiWorkspace.startSession)) return undefined
 
-  // 兜底：sessions.create + sessions.open（底层原语，暴露为 ctx.sessions）
-  const sessions = lookup('sessions') as { create?: unknown; open?: unknown } | undefined
-  if (sessions !== undefined && isCallable(sessions.create) && isCallable(sessions.open)) {
-    const create = sessions.create as (opts?: { workspaceId?: string }) => Promise<unknown>
-    const open = sessions.open as (id: string) => unknown
-    return {
-      start: () => {
-        // create() 返回 Promise<SessionId>；身份可用后再 open 导航。
-        // 静默失败是刻意的：宿主未就绪时宁可不导航，也不向用户抛异常。
-        void create.call(sessions).then(
-          (sessionId) => {
-            if (typeof sessionId === 'string' && sessionId !== '') open.call(sessions, sessionId)
-          },
-          () => {},
-        )
-      },
-    }
+  type StartSession = (
+    workspaceId?: string,
+    options?: { prompt?: string; clearPreviousDraft?: boolean },
+  ) => unknown
+  const startSession = uiWorkspace.startSession as StartSession
+  return {
+    start: (prompt: string, workspaceId?: string) => {
+      // 与宿主 UI 同款调用约定：startSession 挂在服务实例上，需保留 this；
+      // 也不替宿主吞异常（宿主内部 .catch + 通知，与它自己的 New Session 一致）。
+      // clearPreviousDraft：目标空白会话若残留文本，宿主默认「保留」并静默丢弃本次
+      // 场景文本（requestDraftInitialization → 'preserved'）；本插件既有语义是覆盖
+      // （原 setDraft 无条件替换），故显式声明清空。
+      startSession.call(uiWorkspace, workspaceId, { prompt, clearPreviousDraft: true })
+    },
   }
-
-  return undefined
 }
 
 /**
@@ -416,34 +411,4 @@ export function validateVarForm(form: VarForm | null): boolean {
   const rows = Array.isArray(form.options) ? form.options : []
   if (rows.length > 0) return normalizeVarOptions(rows).length === rows.length
   return form.value.trim().length > 0
-}
-
-/** 挂起填充有效期：超过后丢弃（startSession 失败时不误填之后手动新建的会话）。 */
-export const PENDING_TTL_MS = 15_000
-
-/**
- * 到达窗口：startSession 的导航是亚秒级的 SPA 切换，新会话挂载应在窗口内完成。
- * 窗口外才到达的挂载，多半是用户手动切到了别的空白会话——不得误填。
- * 根治需要 workspaces.startSession 返回新会话 id 供精确匹配（宿主 API 增强，
- * 超出插件改动范围），先用到达窗口把误填暴露面从 15s 收窄到 5s。
- */
-export const PENDING_ARRIVAL_MS = 5_000
-
-/**
- * 挂起填充是否可在当前挂载的会话上落地：
- * - 会话必须空白（blank）；
- * - 必须在到达窗口内（PENDING_ARRIVAL_MS，见上）；
- * - mountId 与 fromId 都必须存在且不同（确认为新会话，而非同一会话重挂载）。
- * 无法确认会话身份（任一缺失）时保守拒绝。
- */
-export function isPendingFillEligible(
-  sessionBlank: boolean,
-  elapsedMs: number,
-  fromSessionId: string | undefined,
-  mountSessionId: string | undefined,
-): boolean {
-  if (!sessionBlank) return false
-  if (elapsedMs > PENDING_ARRIVAL_MS) return false
-  if (mountSessionId === undefined || fromSessionId === undefined) return false
-  return mountSessionId !== fromSessionId
 }

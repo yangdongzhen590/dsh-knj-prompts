@@ -3,9 +3,9 @@
  *
  * 流程：选场景 →（提示词含 {变量} 时先弹填充面板）→ 当前会话是空白会话
  * 则直接 setDraft 填充草稿；否则经宿主「新建会话」能力（engine.resolveSceneSessionStarter
- * 逐级解析：uiWorkspace.startSession 优先，sessions.create+open 兜底）切到同工作区的
- * 空白会话，由新会话挂载的本组件消费 pendingFill 完成填充；微调即可发送。
- * 宿主 API 结论见 PROBE.md。
+ * 解析 uiWorkspace.startSession）切到同工作区的空白会话，**并在同一次调用里把草稿交给宿主**
+ * （0.2.1 的 startSession({ prompt, clearPreviousDraft }) 由宿主在导航前按会话身份写入）；
+ * 微调即可发送。宿主 API 结论见 PROBE.md。
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { fetchScenes, fetchVars, saveScenes, saveVars, uploadScenePackage } from './api.ts'
@@ -28,8 +28,6 @@ import {
   hasDirtyScenes,
   hasDirtyVars,
   hasDuplicateVarNames,
-  isPendingFillEligible,
-  PENDING_TTL_MS,
   readSessionIdentity,
   validateScene,
   validateVar,
@@ -40,10 +38,6 @@ import {
 import type { SceneForm, SceneSessionStarter, SessionIdentity, SessionSnapshotLike, VarForm } from './engine.ts'
 import { IconChevronDown, IconClose, IconPlus, IconSparkles, IconStar, IconTrash } from './icons.tsx'
 import type { PromptVar, Scene, VarOption } from '../types.ts'
-
-/** 挂起填充：跨会话切换传递待填文本（模块级，生命周期 = 页面）。 */
-interface PendingFill { text: string; at: number; fromSessionId?: string }
-let pendingFill: PendingFill | undefined
 
 type PickerMode = 'menu' | 'fill' | 'export-select'
 
@@ -78,7 +72,7 @@ function resolveIdentity(props: ScenePickerProps): SessionIdentity | undefined {
 
 /**
  * 应用填充：去处决策见 engine.decideSceneFill
- * （身份不可得/会话空白 → 原地填；非空白 + 能力可调用 → 挂起并切新会话）。
+ * （身份不可得/会话空白/无可用通道 → 原地填；非空白 + 能力可调用 → 带草稿开新会话）。
  * identity 由组件在渲染期解析一次后传入，避免事件里再读 hook。
  */
 function applySceneText(
@@ -88,12 +82,13 @@ function applySceneText(
 ): void {
   const starter = props.sessionStarter?.()
   const target = decideSceneFill(identity, starter !== undefined)
-  if (target === 'current-composer') {
+  if (target !== 'new-session' || starter === undefined) {
     props.inputActions?.setDraft(text)
     return
   }
-  pendingFill = { text, at: Date.now(), fromSessionId: identity?.sessionId }
-  starter!.start()
+  // 一次调用：宿主在 openWorkspace 的 beforeOpen 里按会话身份写入草稿（导航前完成），
+  // 所以不需要暂存文本、也不需要等新会话挂载后再补填。
+  starter.start(text)
 }
 
 export function ScenePicker(props: ScenePickerProps) {
@@ -118,27 +113,6 @@ export function ScenePicker(props: ScenePickerProps) {
   // 当前会话身份：owner share 优先，缺失时取 session 作用域标准套件（真实来源）。
   // useSession 是宿主注入的稳定 hook，无条件调用以保持 hook 调用顺序稳定。
   const identity = resolveIdentity(props)
-
-  // 消费挂起填充：新空白会话挂载/重渲染时落地（TTL 内 + 会话差量守卫；幂等）
-  useEffect(() => {
-    if (!pendingFill) return
-    if (
-      isPendingFillEligible(
-        identity?.blank === true,
-        Date.now() - pendingFill.at,
-        pendingFill.fromSessionId,
-        identity?.sessionId,
-      ) &&
-      props.inputActions
-    ) {
-      const text = pendingFill.text
-      pendingFill = undefined
-      props.inputActions.setDraft(text)
-    } else if (Date.now() - pendingFill.at > PENDING_TTL_MS) {
-      // 过期清理：不让挂起填充无限滞留
-      pendingFill = undefined
-    }
-  })
 
   const load = useCallback(async () => {
     setScenes(null)

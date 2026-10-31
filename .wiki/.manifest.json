@@ -1,4 +1,16 @@
 {
   "version": 1,
-  "sources": {}
+  "sources": {
+    "mine:enum:test-fixtures/mining": {
+      "content_hash": "15348e58a22ecbb00dcc2718669824ba1cb4d8fc30c4cd7ff42fc243715783df",
+      "last_ingested": "2026-10-14T16:50:58.443Z",
+      "pages_produced": [
+        "order-status",
+        "payment-constants",
+        "simple-flag",
+        "table-t-order",
+        "table-t-order-item"
+      ]
+    }
+  }
 }
